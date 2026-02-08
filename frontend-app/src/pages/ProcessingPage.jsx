@@ -67,7 +67,13 @@ function ProcessingPage({ session, config, onComplete, onCancel, onReset }) {
     }
 
     const startPolling = () => {
+        let isPolling = false // Guard to prevent overlapping requests
+
         pollingRef.current = setInterval(async () => {
+            // Skip if previous request is still in flight
+            if (isPolling) return
+            isPolling = true
+
             try {
                 const response = await fetch(`${API_URL}/api/status/${session.session_id}`)
                 const data = await response.json()
@@ -95,8 +101,10 @@ function ProcessingPage({ session, config, onComplete, onCancel, onReset }) {
                 }
             } catch (error) {
                 console.error('Polling error:', error)
+            } finally {
+                isPolling = false
             }
-        }, 500) // Poll every 500ms for smoother updates
+        }, 2000) // Poll every 2 seconds to prevent resource exhaustion
     }
 
     const handleComplete = async () => {

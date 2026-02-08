@@ -4,6 +4,7 @@ FastAPI application with WebSocket support for real-time annotation progress.
 """
 
 import os
+import re
 import uuid
 import asyncio
 from pathlib import Path
@@ -39,6 +40,32 @@ sessions = {}
 
 # WebSocket connections
 ws_connections = {}
+
+
+def extract_label_from_filename(filename: str) -> str:
+    """
+    Extract a clean label from an image filename.
+    Examples:
+        'air_conditioner_1.jpg' -> 'air conditioner'
+        'applesauce_001.png' -> 'applesauce'
+        'PersonWalking.jpeg' -> 'person walking'
+    """
+    # Remove extension
+    name = Path(filename).stem
+    
+    # Remove trailing numbers (e.g., _1, _001, 01)
+    name = re.sub(r'[_\-]?\d+$', '', name)
+    
+    # Handle camelCase and PascalCase
+    name = re.sub(r'([a-z])([A-Z])', r'\1 \2', name)
+    
+    # Replace underscores and dashes with spaces
+    name = name.replace('_', ' ').replace('-', ' ')
+    
+    # Clean up multiple spaces and strip
+    name = re.sub(r'\s+', ' ', name).strip().lower()
+    
+    return name if name else 'object'
 
 
 class AnnotationConfig(BaseModel):
@@ -179,10 +206,20 @@ async def run_annotation(session_id: str, images: list, config: AnnotationConfig
     
     try:
         for i, image_path in enumerate(images):
-            # Run annotation on image
+            # Extract label from filename for contextual detection
+            filename = os.path.basename(image_path)
+            filename_label = extract_label_from_filename(filename)
+            
+            # Use filename label if user specified generic 'object', otherwise use user's labels
+            if config.objects and config.objects[0].lower() not in ('object', 'objects', 'item', 'items'):
+                detection_labels = config.objects
+            else:
+                detection_labels = [filename_label]
+            
+            # Run annotation on image with contextual label
             result = await annotation_service.annotate_image(
                 image_path,
-                config.objects,
+                detection_labels,
                 config.box_threshold,
                 config.text_threshold
             )
@@ -202,8 +239,8 @@ async def run_annotation(session_id: str, images: list, config: AnnotationConfig
                     "detections": len(result.get("boxes", []))
                 })
             
-            # Small delay to allow UI updates
-            await asyncio.sleep(0.1)
+            # Minimal delay to yield to other tasks (reduced from 0.1s for speed)
+            await asyncio.sleep(0.01)
         
         session["status"] = "completed"
         

@@ -62,34 +62,50 @@ function UploadPage({ onComplete }) {
             const formData = new FormData()
             formData.append('file', file)
 
-            // Simulate progress for better UX
-            const progressInterval = setInterval(() => {
-                setUploadProgress(prev => Math.min(prev + 10, 90))
-            }, 200)
+            // Use XMLHttpRequest for real upload progress
+            const result = await new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest()
 
-            const response = await fetch(`${API_URL}/api/upload`, {
-                method: 'POST',
-                body: formData
+                xhr.upload.addEventListener('progress', (e) => {
+                    if (e.lengthComputable) {
+                        const progress = Math.round((e.loaded / e.total) * 100)
+                        setUploadProgress(progress)
+                    }
+                })
+
+                xhr.addEventListener('load', () => {
+                    if (xhr.status >= 200 && xhr.status < 300) {
+                        try {
+                            resolve(JSON.parse(xhr.responseText))
+                        } catch (e) {
+                            reject(new Error('Invalid server response'))
+                        }
+                    } else {
+                        try {
+                            const errorData = JSON.parse(xhr.responseText)
+                            reject(new Error(errorData.detail || 'Upload failed'))
+                        } catch (e) {
+                            reject(new Error(`Upload failed: ${xhr.status}`))
+                        }
+                    }
+                })
+
+                xhr.addEventListener('error', () => reject(new Error('Network error')))
+                xhr.addEventListener('timeout', () => reject(new Error('Upload timeout')))
+
+                xhr.open('POST', `${API_URL}/api/upload`)
+                xhr.timeout = 600000 // 10 minute timeout for large files
+                xhr.send(formData)
             })
-
-            clearInterval(progressInterval)
-            setUploadProgress(100)
-
-            if (!response.ok) {
-                const errorData = await response.json()
-                throw new Error(errorData.detail || 'Upload failed')
-            }
-
-            const data = await response.json()
 
             // Generate preview URLs for images
             // Handle both Windows (\\) and Unix (/) path separators
-            const previews = data.images.slice(0, 8).map((img, i) => {
+            const previews = result.images.slice(0, 8).map((img, i) => {
                 const filename = img.split(/[/\\]/).pop()
                 return {
                     id: i,
                     path: img,
-                    url: `${API_URL}/uploads/${data.session_id}/${filename}`
+                    url: `${API_URL}/uploads/${result.session_id}/${filename}`
                 }
             })
 
@@ -97,7 +113,7 @@ function UploadPage({ onComplete }) {
 
             // Small delay to show 100% progress
             setTimeout(() => {
-                onComplete(data)
+                onComplete(result)
             }, 500)
 
         } catch (err) {
@@ -213,7 +229,11 @@ function UploadPage({ onComplete }) {
                                         style={{ width: `${uploadProgress}%` }}
                                     />
                                 </div>
-                                <span className="progress-text">{uploadProgress}% uploaded</span>
+                                <span className="progress-text">
+                                    {uploadProgress === 0
+                                        ? 'Preparing upload... (large files may take a moment)'
+                                        : `${uploadProgress}% uploaded`}
+                                </span>
                             </div>
                         )}
 

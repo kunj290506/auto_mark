@@ -34,6 +34,11 @@ class AnnotationService:
         print(f"   GPU Available: {self.gpu_available}")
         print(f"   Models Directory: {MODELS_DIR.absolute()}")
         print(f"   SAM Checkpoint: {SAM_CHECKPOINT}")
+        
+        # Performance flags
+        self.use_fp16 = self.device == "cuda"
+        if self.use_fp16:
+            print(f"   FP16 Inference: Enabled (faster)")
     
     async def _load_model(self):
         """Load Grounding DINO model from HuggingFace"""
@@ -49,6 +54,20 @@ class AnnotationService:
             self.processor = AutoProcessor.from_pretrained(model_id)
             self.model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id)
             self.model = self.model.to(self.device)
+            
+            # Enable FP16 for faster inference on GPU
+            if self.use_fp16:
+                self.model = self.model.half()
+                print("   Using FP16 precision for faster inference")
+            
+            # Try torch.compile for additional speedup (PyTorch 2.0+)
+            try:
+                import torch._dynamo
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+                print("   torch.compile enabled")
+            except Exception:
+                pass  # torch.compile not available
+            
             self.model.eval()
             
             self._model_loaded = True
@@ -155,7 +174,11 @@ class AnnotationService:
         inputs = self.processor(images=image, text=text, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
-        with torch.no_grad():
+        # Use FP16 for inputs if enabled
+        if self.use_fp16:
+            inputs = {k: v.half() if v.dtype == torch.float32 else v for k, v in inputs.items()}
+        
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=self.use_fp16):
             outputs = self.model(**inputs)
         
         target_sizes = torch.tensor([[height, width]]).to(self.device)
