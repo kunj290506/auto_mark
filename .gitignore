@@ -8,7 +8,7 @@ venv/
 dist/
 build/
 *.egg-info/
-backend/models/*.pth # Ignore large model files
+backend/models/*.pth
 backend/uploads/
 backend/outputs/
 *.log

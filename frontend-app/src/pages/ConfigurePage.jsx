@@ -83,7 +83,7 @@ function ConfigurePage({ session, config, onSubmit, onBack }) {
                     <div className="skip-detection-box">
                         <label className="toggle-option skip-toggle">
                             <div className="toggle-info">
-                                <span className="toggle-label">⏭️ Skip Object Description</span>
+                                <span className="toggle-label">Skip Object Description</span>
                                 <span className="toggle-desc">Detect all objects automatically without specific labels</span>
                             </div>
                             <input
@@ -133,7 +133,7 @@ function ConfigurePage({ session, config, onSubmit, onBack }) {
                             </div>
 
                             <div className="tips-box">
-                                <h4>💡 Tips for Better Detection</h4>
+                                <h4>Tips for Better Detection</h4>
                                 <ul>
                                     <li>Be specific: "red car" works better than "car"</li>
                                     <li>Add context: "person wearing helmet" finds specific people</li>
@@ -146,7 +146,12 @@ function ConfigurePage({ session, config, onSubmit, onBack }) {
                     {/* Show message when skipping */}
                     {localConfig.skipDetection && (
                         <div className="skip-info-box">
-                            <div className="skip-info-icon">🔍</div>
+                            <div className="skip-info-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <circle cx="11" cy="11" r="8" />
+                                    <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                                </svg>
+                            </div>
                             <div className="skip-info-content">
                                 <h4>Auto-detect All Objects</h4>
                                 <p>The model will attempt to detect all visible objects in your images without specific labels. Results will be labeled as "object".</p>
@@ -277,19 +282,19 @@ function ConfigurePage({ session, config, onSubmit, onBack }) {
             {/* Session Info */}
             <div className="session-summary glass-card animate-slideUp delay-300">
                 <div className="summary-stat">
-                    <span className="stat-icon">📁</span>
+                    <span className="stat-icon"></span>
                     <span className="stat-value">{session?.image_count || 0}</span>
                     <span className="stat-label">Images</span>
                 </div>
                 <div className="summary-stat">
-                    <span className="stat-icon">🎯</span>
+                    <span className="stat-icon"></span>
                     <span className="stat-value">
                         {localConfig.skipDetection ? 'Auto' : localConfig.objects.filter(o => o.trim()).length}
                     </span>
                     <span className="stat-label">Objects</span>
                 </div>
                 <div className="summary-stat">
-                    <span className="stat-icon">📊</span>
+                    <span className="stat-icon"></span>
                     <span className="stat-value">{localConfig.exportFormat.toUpperCase()}</span>
                     <span className="stat-label">Format</span>
                 </div>
