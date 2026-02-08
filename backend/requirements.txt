@@ -1,0 +1,26 @@
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+websockets==12.0
+Pillow==10.2.0
+numpy==1.26.3
+torch>=2.0.0
+torchvision>=0.15.0
+transformers==4.37.0
+aiofiles==23.2.1
+python-dotenv==1.0.0
+pydantic==2.5.3
+
+# Grounding DINO - Local checkpoint version
+# Install from: https://github.com/IDEA-Research/GroundingDINO
+# pip install -e .
+groundingdino-py==0.4.0
+
+# SAM - Segment Anything Model (optional, for segmentation)
+# Install from: https://github.com/facebookresearch/segment-anything
+# pip install git+https://github.com/facebookresearch/segment-anything.git
+segment-anything
+opencv-python>=4.8.0
+
+# Supervision for annotation visualization
+supervision==0.18.0

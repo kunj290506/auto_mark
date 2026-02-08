@@ -1,0 +1,15 @@
+__pycache__/
+node_modules/
+venv/
+.env
+.DS_Store
+.vscode/
+.idea/
+dist/
+build/
+*.egg-info/
+backend/models/*.pth # Ignore large model files
+backend/uploads/
+backend/outputs/
+*.log
+.gemini/
