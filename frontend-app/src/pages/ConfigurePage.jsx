@@ -1,6 +1,12 @@
 import React, { useState } from 'react'
 import './ConfigurePage.css'
 
+const AUTO_DETECT_PROMPTS = [
+    "person", "car", "animal", "furniture", "food", "electronic device",
+    "building", "tool", "sports equipment", "vehicle", "clothing item",
+    "container", "plant", "sign", "appliance"
+]
+
 function ConfigurePage({ session, config, onSubmit, onBack }) {
     const [localConfig, setLocalConfig] = useState({
         objects: config.objects.length > 0 ? config.objects : [''],
@@ -10,7 +16,7 @@ function ConfigurePage({ session, config, onSubmit, onBack }) {
         exportFormat: config.exportFormat,
         minBoxSize: 10,
         removeOverlaps: true,
-        skipDetection: false  // New: Skip object detection option
+        skipDetection: false
     })
 
     const handleObjectChange = (index, value) => {
@@ -35,22 +41,21 @@ function ConfigurePage({ session, config, onSubmit, onBack }) {
         setLocalConfig({
             ...localConfig,
             skipDetection: checked,
-            // If skipping, use a generic "object" label
             objects: checked ? ['object'] : ['']
         })
     }
 
+    // Bug 20: Use diverse prompts instead of ['object'] when skipping
     const handleSubmit = () => {
-        if (!localConfig.skipDetection) {
+        if (localConfig.skipDetection) {
+            onSubmit({ ...localConfig, objects: AUTO_DETECT_PROMPTS })
+        } else {
             const validObjects = localConfig.objects.filter(obj => obj.trim())
             if (validObjects.length === 0) {
                 alert('Please add at least one object to detect, or enable "Skip Detection"')
                 return
             }
             onSubmit({ ...localConfig, objects: validObjects })
-        } else {
-            // If skipping, use a generic detection prompt
-            onSubmit({ ...localConfig, objects: ['object'] })
         }
     }
 
@@ -154,7 +159,7 @@ function ConfigurePage({ session, config, onSubmit, onBack }) {
                             </div>
                             <div className="skip-info-content">
                                 <h4>Auto-detect All Objects</h4>
-                                <p>The model will attempt to detect all visible objects in your images without specific labels. Results will be labeled as "object".</p>
+                                <p>The model will use {AUTO_DETECT_PROMPTS.length} diverse category prompts to detect common objects in your images automatically.</p>
                             </div>
                         </div>
                     )}

@@ -1,7 +1,7 @@
 import React, { useState, useRef, useCallback } from 'react'
+import { API_URL } from '../config'
+import JSZip from 'jszip'
 import './UploadPage.css'
-
-const API_URL = 'http://localhost:8000'
 
 function UploadPage({ onComplete }) {
     const [isDragOver, setIsDragOver] = useState(false)
@@ -10,7 +10,30 @@ function UploadPage({ onComplete }) {
     const [uploadProgress, setUploadProgress] = useState(0)
     const [error, setError] = useState(null)
     const [previewImages, setPreviewImages] = useState([])
+    const [localPreviews, setLocalPreviews] = useState([])
     const fileInputRef = useRef(null)
+
+    // UI 9: Preview images from ZIP before upload
+    const previewZip = async (zipFile) => {
+        try {
+            const zip = await JSZip.loadAsync(zipFile)
+            const imageFiles = []
+            zip.forEach((path, file) => {
+                if (/\.(jpg|jpeg|png|bmp|webp)$/i.test(path) && !path.includes('__MACOSX')) {
+                    imageFiles.push(file)
+                }
+            })
+            const previews = await Promise.all(
+                imageFiles.slice(0, 8).map(async (file, i) => {
+                    const blob = await file.async('blob')
+                    return { id: i, url: URL.createObjectURL(blob) }
+                })
+            )
+            setLocalPreviews(previews)
+        } catch (e) {
+            console.warn('Could not preview ZIP:', e)
+        }
+    }
 
     const handleDragOver = useCallback((e) => {
         e.preventDefault()
@@ -30,6 +53,7 @@ function UploadPage({ onComplete }) {
         if (droppedFile && droppedFile.name.endsWith('.zip')) {
             setFile(droppedFile)
             setError(null)
+            previewZip(droppedFile)
         } else {
             setError('Please upload a ZIP file')
         }
@@ -40,6 +64,7 @@ function UploadPage({ onComplete }) {
         if (selectedFile) {
             setFile(selectedFile)
             setError(null)
+            previewZip(selectedFile)
         }
     }
 
@@ -99,7 +124,6 @@ function UploadPage({ onComplete }) {
             })
 
             // Generate preview URLs for images
-            // Handle both Windows (\\) and Unix (/) path separators
             const previews = result.images.slice(0, 8).map((img, i) => {
                 const filename = img.split(/[/\\]/).pop()
                 return {
@@ -127,6 +151,7 @@ function UploadPage({ onComplete }) {
         setFile(null)
         setError(null)
         setPreviewImages([])
+        setLocalPreviews([])
         if (fileInputRef.current) {
             fileInputRef.current.value = ''
         }
@@ -234,6 +259,20 @@ function UploadPage({ onComplete }) {
                                         ? 'Preparing upload... (large files may take a moment)'
                                         : `${uploadProgress}% uploaded`}
                                 </span>
+                            </div>
+                        )}
+
+                        {/* UI 9: Local ZIP previews (before upload) */}
+                        {localPreviews.length > 0 && !uploading && previewImages.length === 0 && (
+                            <div className="image-previews">
+                                <h5 className="previews-title">Preview (before upload)</h5>
+                                <div className="previews-grid">
+                                    {localPreviews.map((img) => (
+                                        <div key={img.id} className="preview-item">
+                                            <img src={img.url} alt={`Preview ${img.id + 1}`} />
+                                        </div>
+                                    ))}
+                                </div>
                             </div>
                         )}
 

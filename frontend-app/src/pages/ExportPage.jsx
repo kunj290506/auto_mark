@@ -1,106 +1,70 @@
 import React, { useState } from 'react'
+import { API_URL } from '../config'
+import SkeletonLoader from '../components/SkeletonLoader'
 import './ExportPage.css'
 
-const API_URL = 'http://localhost:8000'
+// UI 7: Format comparison table
+const FORMAT_COMPARE = [
+    { feature: 'Single file output', coco: true, yolo: false, voc: false, roboflow: true },
+    { feature: 'Segmentation masks', coco: true, yolo: false, voc: false, roboflow: true },
+    { feature: 'Polygon annotations', coco: true, yolo: false, voc: false, roboflow: true },
+    { feature: 'Per-image files', coco: false, yolo: true, voc: true, roboflow: false },
+    { feature: 'Training ready (YAML)', coco: false, yolo: true, voc: false, roboflow: false },
+    { feature: 'Ultralytics compatible', coco: false, yolo: true, voc: false, roboflow: true },
+    { feature: 'Standard XML format', coco: false, yolo: false, voc: true, roboflow: false }
+]
 
 function ExportPage({ session, annotations, config, onBack, onNewProject }) {
-    const [selectedFormat, setSelectedFormat] = useState(config.exportFormat)
+    const [selectedFormat, setSelectedFormat] = useState(config?.exportFormat || 'coco')
     const [exporting, setExporting] = useState(false)
-    const [exportComplete, setExportComplete] = useState(false)
+    const [exported, setExported] = useState(false)
+    const [error, setError] = useState(null)
+    const [showCompare, setShowCompare] = useState(false)
+
+    const stats = annotations ? {
+        total_images: Object.keys(annotations.annotations || {}).length,
+        total_detections: Object.values(annotations.annotations || {}).reduce(
+            (sum, ann) => sum + (ann.boxes?.length || 0), 0
+        ),
+        classes: [...new Set(
+            Object.values(annotations.annotations || {}).flatMap(ann => ann.labels || [])
+        )]
+    } : null
 
     const formats = [
-        {
-            id: 'coco',
-            name: 'COCO JSON',
-            icon: (
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                    <polyline points="14 2 14 8 20 8" />
-                    <line x1="16" y1="13" x2="8" y2="13" />
-                    <line x1="16" y1="17" x2="8" y2="17" />
-                    <polyline points="10 9 9 9 8 9" />
-                </svg>
-            ),
-            description: 'Industry standard format for object detection. Single JSON file with all annotations.',
-            features: ['Single file', 'Segmentation support', 'Category hierarchy']
-        },
-        {
-            id: 'yolo',
-            name: 'YOLO Format',
-            icon: (
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
-                    <circle cx="8.5" cy="8.5" r="1.5" />
-                    <polyline points="21 15 16 10 5 21" />
-                </svg>
-            ),
-            description: 'Optimized for YOLO models. Separate label files per image with normalized coordinates.',
-            features: ['Fast training', 'Lightweight', 'Easy integration']
-        },
-        {
-            id: 'voc',
-            name: 'Pascal VOC',
-            icon: (
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-                    <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" />
-                    <polyline points="14 2 14 8 20 8" />
-                    <path d="M10 13l-2 2 2 2" />
-                    <path d="M14 17l2-2-2-2" />
-                </svg>
-            ),
-            description: 'XML-based format compatible with many detection frameworks.',
-            features: ['XML format', 'Verbose metadata', 'Wide compatibility']
-        },
-        {
-            id: 'roboflow',
-            name: 'Roboflow',
-            icon: (
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-                    <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />
-                </svg>
-            ),
-            description: 'Ready to upload to Roboflow platform for augmentation and training.',
-            features: ['Platform ready', 'Augmentation', 'Version control']
-        }
+        { id: 'coco', name: 'COCO JSON', desc: 'Industry standard. Single JSON file with bounding boxes and segmentation polygons.', icon: 'C' },
+        { id: 'yolo', name: 'YOLO', desc: 'Training-ready format. Per-image .txt files with data.yaml configuration.', icon: 'Y' },
+        { id: 'voc', name: 'Pascal VOC', desc: 'XML-based format. Individual XML files for each image with bounding box coordinates.', icon: 'V' },
+        { id: 'roboflow', name: 'Roboflow', desc: 'Roboflow platform compatible. COCO format with additional metadata.', icon: 'R' }
     ]
-
-    // Stats
-    const totalImages = annotations?.images?.length || 0
-    const totalDetections = Object.values(annotations?.annotations || {}).reduce(
-        (sum, ann) => sum + (ann.boxes?.length || 0), 0
-    )
-    const classes = [...new Set(
-        Object.values(annotations?.annotations || {}).flatMap(ann => ann.labels || [])
-    )]
 
     const handleExport = async () => {
         setExporting(true)
+        setError(null)
 
         try {
-            const response = await fetch(
-                `${API_URL}/api/export/${session.session_id}?format=${selectedFormat}`,
-                { method: 'POST' }
-            )
+            const response = await fetch(`${API_URL}/api/export/${session.session_id}?format=${selectedFormat}`, {
+                method: 'POST'
+            })
 
             if (!response.ok) {
                 throw new Error('Export failed')
             }
 
-            // Download the file
+            // Download the zip file
             const blob = await response.blob()
-            const url = window.URL.createObjectURL(blob)
+            const url = URL.createObjectURL(blob)
             const a = document.createElement('a')
             a.href = url
-            a.download = `annotations_${session.session_id.slice(0, 8)}_${selectedFormat}.zip`
+            a.download = `annotations_${session.session_id}_${selectedFormat}.zip`
             document.body.appendChild(a)
             a.click()
             document.body.removeChild(a)
-            window.URL.revokeObjectURL(url)
+            URL.revokeObjectURL(url)
 
-            setExportComplete(true)
-        } catch (error) {
-            console.error('Export error:', error)
-            alert('Export failed. Please try again.')
+            setExported(true)
+        } catch (err) {
+            setError(err.message)
         } finally {
             setExporting(false)
         }
@@ -108,187 +72,160 @@ function ExportPage({ session, annotations, config, onBack, onNewProject }) {
 
     return (
         <div className="export-page">
-            {!exportComplete ? (
-                <>
-                    {/* Stats Summary */}
-                    <div className="export-stats glass-card animate-slideUp">
-                        <div className="stat-item">
-                            <span className="stat-icon">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                                </svg>
-                            </span>
-                            <div className="stat-content">
-                                <span className="stat-value">{totalImages}</span>
-                                <span className="stat-label">Images</span>
-                            </div>
+            {/* Dataset Summary */}
+            <div className="export-summary glass-card animate-slideUp">
+                <h3>Dataset Summary</h3>
+                {stats ? (
+                    <div className="summary-grid">
+                        <div className="summary-item">
+                            <span className="summary-value">{stats.total_images}</span>
+                            <span className="summary-label">Images</span>
                         </div>
-                        <div className="stat-divider" />
-                        <div className="stat-item">
-                            <span className="stat-icon">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                    <circle cx="12" cy="12" r="10" />
-                                    <circle cx="12" cy="12" r="3" />
-                                </svg>
-                            </span>
-                            <div className="stat-content">
-                                <span className="stat-value">{totalDetections}</span>
-                                <span className="stat-label">Detections</span>
-                            </div>
+                        <div className="summary-item">
+                            <span className="summary-value">{stats.total_detections}</span>
+                            <span className="summary-label">Detections</span>
                         </div>
-                        <div className="stat-divider" />
-                        <div className="stat-item">
-                            <span className="stat-icon">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                    <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z" />
-                                    <line x1="7" y1="7" x2="7.01" y2="7" />
-                                </svg>
-                            </span>
-                            <div className="stat-content">
-                                <span className="stat-value">{classes.length}</span>
-                                <span className="stat-label">Classes</span>
-                            </div>
+                        <div className="summary-item">
+                            <span className="summary-value">{stats.classes.length}</span>
+                            <span className="summary-label">Classes</span>
                         </div>
-                    </div>
-
-                    {/* Classes */}
-                    <div className="classes-section animate-slideUp delay-100">
-                        <h4>Detected Classes</h4>
-                        <div className="classes-grid">
-                            {classes.map((cls, i) => (
-                                <span key={i} className="class-badge">
-                                    {cls}
-                                </span>
+                        <div className="summary-item classes-list">
+                            {stats.classes.map((cls, i) => (
+                                <span key={i} className="class-chip">{cls}</span>
                             ))}
                         </div>
                     </div>
+                ) : (
+                    /* UI 8: Skeleton loader */
+                    <div className="summary-grid">
+                        {[1, 2, 3].map(i => (
+                            <div key={i} className="summary-item">
+                                <SkeletonLoader width="80px" height="36px" borderRadius="8px" />
+                                <SkeletonLoader width="60px" height="14px" borderRadius="4px" />
+                            </div>
+                        ))}
+                    </div>
+                )}
+            </div>
 
-                    {/* Format Selection */}
-                    <div className="format-section animate-slideUp delay-200">
-                        <h3>Select Export Format</h3>
-                        <div className="formats-grid">
-                            {formats.map((format) => (
-                                <label
-                                    key={format.id}
-                                    className={`format-card glass-card ${selectedFormat === format.id ? 'selected' : ''}`}
-                                >
-                                    <input
-                                        type="radio"
-                                        name="format"
-                                        value={format.id}
-                                        checked={selectedFormat === format.id}
-                                        onChange={(e) => setSelectedFormat(e.target.value)}
-                                    />
-                                    <div className="format-header">
-                                        <span className="format-icon">{format.icon}</span>
-                                        <h4 className="format-name">{format.name}</h4>
-                                    </div>
-                                    <p className="format-description">{format.description}</p>
-                                    <ul className="format-features">
-                                        {format.features.map((feature, i) => (
-                                            <li key={i}>
-                                                <svg viewBox="0 0 16 16" fill="currentColor">
-                                                    <path d="M13.485 4.515a1 1 0 0 0-1.414 0L6.5 10.086 3.929 7.515a1 1 0 1 0-1.414 1.414l3.285 3.285a1 1 0 0 0 1.414 0l6.271-6.271a1 1 0 0 0 0-1.414z" />
-                                                </svg>
-                                                {feature}
-                                            </li>
-                                        ))}
-                                    </ul>
-                                    <div className="format-check">
-                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
-                                            <polyline points="20,6 9,17 4,12" />
-                                        </svg>
-                                    </div>
-                                </label>
-                            ))}
-                        </div>
-                    </div>
-
-                    {/* Actions */}
-                    <div className="export-actions animate-slideUp delay-300">
-                        <button className="btn btn-secondary" onClick={onBack}>
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                <line x1="19" y1="12" x2="5" y2="12" />
-                                <polyline points="12,19 5,12 12,5" />
-                            </svg>
-                            Back to Viewer
-                        </button>
-                        <div className="download-container">
-                            <label className="dl-label">
-                                <input
-                                    type="checkbox"
-                                    className="dl-input"
-                                    checked={exporting || exportComplete}
-                                    onChange={(e) => !exporting && !exportComplete && handleExport()}
-                                    disabled={exporting || exportComplete}
-                                />
-                                <span className="dl-circle">
-                                    <svg
-                                        className="dl-icon"
-                                        aria-hidden="true"
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        fill="none"
-                                        viewBox="0 0 24 24"
-                                    >
-                                        <path
-                                            stroke="currentColor"
-                                            strokeLinecap="round"
-                                            strokeLinejoin="round"
-                                            strokeWidth="1.5"
-                                            d="M12 19V5m0 14-4-4m4 4 4-4"
-                                        ></path>
-                                    </svg>
-                                    <div className="dl-square"></div>
-                                </span>
-                                <p className="dl-title">Download</p>
-                                <p className="dl-title">Done</p>
-                            </label>
-                        </div>
-                    </div>
-                </>
-            ) : (
-                /* Success State */
-                <div className="export-success animate-slideUp">
-                    <div className="success-icon">
-                        <svg viewBox="0 0 64 64" fill="none">
-                            <circle cx="32" cy="32" r="30" stroke="url(#successGradient)" strokeWidth="4" />
-                            <path d="M20 32l8 8 16-16" stroke="url(#successGradient)" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
-                            <defs>
-                                <linearGradient id="successGradient" x1="0" y1="0" x2="64" y2="64">
-                                    <stop stopColor="#10b981" />
-                                    <stop offset="1" stopColor="#06b6d4" />
-                                </linearGradient>
-                            </defs>
-                        </svg>
-                    </div>
-                    <h2>Export Complete!</h2>
-                    <p>Your annotated dataset has been downloaded successfully.</p>
-
-                    <div className="success-stats glass-card">
-                        <div className="success-stat">
-                            <span className="value">{totalImages}</span>
-                            <span className="label">Images</span>
-                        </div>
-                        <div className="success-stat">
-                            <span className="value">{totalDetections}</span>
-                            <span className="label">Annotations</span>
-                        </div>
-                        <div className="success-stat">
-                            <span className="value">{selectedFormat.toUpperCase()}</span>
-                            <span className="label">Format</span>
-                        </div>
-                    </div>
-
-                    <div className="success-actions">
-                        <button className="btn btn-secondary" onClick={() => setExportComplete(false)}>
-                            Export Another Format
-                        </button>
-                        <button className="btn btn-primary" onClick={onNewProject}>
-                            Start New Project
-                        </button>
-                    </div>
+            {/* Format Selection */}
+            <div className="format-section animate-slideUp delay-100">
+                <div className="format-header">
+                    <h3>Export Format</h3>
+                    <button className="btn btn-sm btn-ghost" onClick={() => setShowCompare(v => !v)}>
+                        {showCompare ? 'Hide Comparison' : 'Compare Formats'}
+                    </button>
                 </div>
-            )}
+
+                {/* UI 7: Format comparison table */}
+                {showCompare && (
+                    <div className="format-compare glass-card animate-slideUp">
+                        <table className="compare-table">
+                            <thead>
+                                <tr>
+                                    <th>Feature</th>
+                                    <th>COCO</th>
+                                    <th>YOLO</th>
+                                    <th>VOC</th>
+                                    <th>Roboflow</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {FORMAT_COMPARE.map((row, i) => (
+                                    <tr key={i}>
+                                        <td>{row.feature}</td>
+                                        <td className={row.coco ? 'yes' : 'no'}>{row.coco ? 'Yes' : '--'}</td>
+                                        <td className={row.yolo ? 'yes' : 'no'}>{row.yolo ? 'Yes' : '--'}</td>
+                                        <td className={row.voc ? 'yes' : 'no'}>{row.voc ? 'Yes' : '--'}</td>
+                                        <td className={row.roboflow ? 'yes' : 'no'}>{row.roboflow ? 'Yes' : '--'}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                )}
+
+                <div className="format-cards">
+                    {formats.map(fmt => (
+                        <div
+                            key={fmt.id}
+                            className={`format-card glass-card glass-card-hover ${selectedFormat === fmt.id ? 'selected' : ''}`}
+                            onClick={() => setSelectedFormat(fmt.id)}
+                        >
+                            <div className="format-icon">{fmt.icon}</div>
+                            <h4>{fmt.name}</h4>
+                            <p>{fmt.desc}</p>
+                            {selectedFormat === fmt.id && (
+                                <div className="format-selected-check">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" width="20" height="20">
+                                        <polyline points="20,6 9,17 4,12" />
+                                    </svg>
+                                </div>
+                            )}
+                        </div>
+                    ))}
+                </div>
+            </div>
+
+            {/* Actions */}
+            <div className="export-actions animate-slideUp delay-200">
+                {error && (
+                    <div className="error-message">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18">
+                            <circle cx="12" cy="12" r="10" />
+                            <line x1="12" y1="8" x2="12" y2="12" />
+                            <line x1="12" y1="16" x2="12.01" y2="16" />
+                        </svg>
+                        {error}
+                    </div>
+                )}
+
+                {exported && (
+                    <div className="success-message">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18">
+                            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+                            <polyline points="22,4 12,14.01 9,11.01" />
+                        </svg>
+                        Export downloaded successfully!
+                    </div>
+                )}
+
+                <div className="action-buttons">
+                    <button className="btn btn-secondary" onClick={onBack}>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18">
+                            <polyline points="15,18 9,12 15,6" />
+                        </svg>
+                        Back to Viewer
+                    </button>
+
+                    <button
+                        className="btn btn-primary btn-lg"
+                        onClick={handleExport}
+                        disabled={exporting}
+                    >
+                        {exporting ? (
+                            <>Exporting...</>
+                        ) : (
+                            <>
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18">
+                                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                                    <polyline points="7,10 12,15 17,10" />
+                                    <line x1="12" y1="15" x2="12" y2="3" />
+                                </svg>
+                                Download {selectedFormat.toUpperCase()} Export
+                            </>
+                        )}
+                    </button>
+
+                    <button className="btn btn-outline" onClick={onNewProject}>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18">
+                            <line x1="12" y1="5" x2="12" y2="19" />
+                            <line x1="5" y1="12" x2="19" y2="12" />
+                        </svg>
+                        New Project
+                    </button>
+                </div>
+            </div>
         </div>
     )
 }

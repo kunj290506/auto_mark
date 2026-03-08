@@ -248,3 +248,24 @@
         text-align: center;
     }
 }
+
+/* UI 6: Current image preview */
+.current-image-preview {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-md);
+}
+
+.processing-thumb {
+    width: 64px;
+    height: 64px;
+    object-fit: cover;
+    border-radius: var(--radius-md);
+    border: 2px solid var(--border-color);
+}
+
+.preview-filename {
+    font-family: var(--font-mono);
+    font-size: 0.8125rem;
+    color: var(--text-secondary);
+}

@@ -1,8 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react'
+import { API_URL } from '../config'
 import './ProcessingPage.css'
-
-// Use direct backend URL
-const API_URL = 'http://localhost:8000'
 
 function ProcessingPage({ session, config, onComplete, onCancel, onReset }) {
     const [status, setStatus] = useState('connecting')
@@ -10,10 +8,13 @@ function ProcessingPage({ session, config, onComplete, onCancel, onReset }) {
     const [currentImage, setCurrentImage] = useState(null)
     const [processedCount, setProcessedCount] = useState(0)
     const [detectionCount, setDetectionCount] = useState(0)
-    const [startTime, setStartTime] = useState(null)
     const [eta, setEta] = useState(null)
     const pollingRef = useRef(null)
     const hasStarted = useRef(false)
+    // Bug 15: Use useRef for startTime instead of state
+    const startTimeRef = useRef(null)
+    // Bug 16: WebSocket ref
+    const wsRef = useRef(null)
 
     useEffect(() => {
         if (!session || hasStarted.current) return
@@ -25,18 +26,25 @@ function ProcessingPage({ session, config, onComplete, onCancel, onReset }) {
             if (pollingRef.current) {
                 clearInterval(pollingRef.current)
             }
+            // Bug 16: Clean up WebSocket
+            if (wsRef.current) {
+                wsRef.current.close()
+                wsRef.current = null
+            }
         }
     }, [session])
 
     const startProcessing = async () => {
-        setStartTime(Date.now())
+        startTimeRef.current = Date.now()
         setStatus('processing')
 
         // Start annotation job first
-        await startAnnotation()
+        const success = await startAnnotation()
 
-        // Then start polling for progress
-        startPolling()
+        if (success) {
+            // Bug 16: Try WebSocket first, fall back to polling
+            connectWebSocket(session.session_id)
+        }
     }
 
     const startAnnotation = async () => {
@@ -48,7 +56,8 @@ function ProcessingPage({ session, config, onComplete, onCancel, onReset }) {
                     objects: config.objects,
                     box_threshold: config.boxThreshold,
                     text_threshold: config.textThreshold,
-                    use_sam: config.useSam || false,
+                    // Bug 22: Strict boolean check
+                    use_sam: config.useSam === true,
                     export_format: config.exportFormat
                 })
             })
@@ -66,11 +75,66 @@ function ProcessingPage({ session, config, onComplete, onCancel, onReset }) {
         }
     }
 
-    const startPolling = () => {
-        let isPolling = false // Guard to prevent overlapping requests
+    // Bug 16: WebSocket connection with polling fallback
+    const connectWebSocket = (sessionId) => {
+        try {
+            const wsUrl = API_URL.replace(/^http/, 'ws')
+            const ws = new WebSocket(`${wsUrl}/ws/${sessionId}`)
+
+            ws.onopen = () => {
+                console.log('WebSocket connected')
+            }
+
+            ws.onmessage = (e) => {
+                const data = JSON.parse(e.data)
+                if (data.type === 'progress') {
+                    setProgress(data.percentage)
+                    setProcessedCount(data.current)
+                    setDetectionCount(prev => prev + data.detections)
+                    setCurrentImage(data.current_image)
+
+                    // Calculate ETA using ref
+                    if (startTimeRef.current && data.current > 0) {
+                        const elapsed = Date.now() - startTimeRef.current
+                        const remaining = (elapsed / data.current) * (session.image_count - data.current)
+                        setEta(Math.ceil(remaining / 1000))
+                    }
+                }
+                if (data.type === 'completed') {
+                    setStatus('completed')
+                    setProgress(100)
+                    setTimeout(() => handleComplete(), 1000)
+                }
+                if (data.type === 'error') {
+                    setStatus('error')
+                }
+            }
+
+            ws.onerror = () => {
+                console.warn('WebSocket failed, falling back to polling')
+                startPollingFallback()
+            }
+
+            ws.onclose = () => {
+                if (status !== 'completed' && status !== 'error') {
+                    startPollingFallback()
+                }
+            }
+
+            wsRef.current = ws
+        } catch (e) {
+            console.warn('WebSocket not available, using polling')
+            startPollingFallback()
+        }
+    }
+
+    const startPollingFallback = () => {
+        // Don't start polling if already polling
+        if (pollingRef.current) return
+
+        let isPolling = false
 
         pollingRef.current = setInterval(async () => {
-            // Skip if previous request is still in flight
             if (isPolling) return
             isPolling = true
 
@@ -83,9 +147,9 @@ function ProcessingPage({ session, config, onComplete, onCancel, onReset }) {
                 setProcessedCount(data.processed_count || 0)
                 setDetectionCount(data.total_detections || 0)
 
-                // Calculate ETA
-                if (startTime && data.processed_count > 0) {
-                    const elapsed = Date.now() - startTime
+                // Bug 15: Calculate ETA using ref
+                if (startTimeRef.current && data.processed_count > 0) {
+                    const elapsed = Date.now() - startTimeRef.current
                     const remaining = (elapsed / data.processed_count) * (session.image_count - data.processed_count)
                     setEta(Math.ceil(remaining / 1000))
                 }
@@ -104,7 +168,7 @@ function ProcessingPage({ session, config, onComplete, onCancel, onReset }) {
             } finally {
                 isPolling = false
             }
-        }, 2000) // Poll every 2 seconds to prevent resource exhaustion
+        }, 2000)
     }
 
     const handleComplete = async () => {
@@ -130,6 +194,10 @@ function ProcessingPage({ session, config, onComplete, onCancel, onReset }) {
             clearInterval(pollingRef.current)
             pollingRef.current = null
         }
+        if (wsRef.current) {
+            wsRef.current.close()
+            wsRef.current = null
+        }
         setStatus('stopped')
     }
 
@@ -141,8 +209,8 @@ function ProcessingPage({ session, config, onComplete, onCancel, onReset }) {
     }
 
     const formatElapsed = () => {
-        if (!startTime) return '0:00'
-        const elapsed = Math.floor((Date.now() - startTime) / 1000)
+        if (!startTimeRef.current) return '0:00'
+        const elapsed = Math.floor((Date.now() - startTimeRef.current) / 1000)
         const mins = Math.floor(elapsed / 60)
         const secs = elapsed % 60
         return `${mins}:${secs.toString().padStart(2, '0')}`
@@ -153,7 +221,7 @@ function ProcessingPage({ session, config, onComplete, onCancel, onReset }) {
     useEffect(() => {
         if (status !== 'processing') return
         const interval = setInterval(() => {
-            forceUpdate(n => n + 1) // Force re-render for elapsed time
+            forceUpdate(n => n + 1)
         }, 1000)
         return () => clearInterval(interval)
     }, [status])
@@ -275,11 +343,18 @@ function ProcessingPage({ session, config, onComplete, onCancel, onReset }) {
                     </div>
                 </div>
 
-                {/* Current Image */}
+                {/* UI 6: Current Image Preview */}
                 {currentImage && status === 'processing' && (
                     <div className="current-image glass-card animate-slideUp">
                         <span className="current-label">Currently Processing</span>
-                        <span className="current-filename">{currentImage.split('/').pop()}</span>
+                        <div className="current-image-preview">
+                            <img
+                                src={`${API_URL}/uploads/${session.session_id}/${currentImage.split(/[/\\]/).pop()}`}
+                                alt="Processing"
+                                className="processing-thumb"
+                            />
+                            <span className="preview-filename">{currentImage.split(/[/\\]/).pop()}</span>
+                        </div>
                     </div>
                 )}
 

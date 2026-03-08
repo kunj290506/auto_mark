@@ -5,6 +5,7 @@ Export Service - Convert annotations to multiple formats (COCO, YOLO, VOC, Robof
 import os
 import json
 import zipfile
+import yaml
 from pathlib import Path
 from typing import Dict, List
 from datetime import datetime
@@ -145,25 +146,29 @@ class ExportService:
                     "score": score
                 }
                 
-                # Add segmentation if available
-                if i < len(segmentations) and segmentations[i]:
+                # Include shape_type if available
+                if "shape_type" in box:
+                    ann_entry["shape_type"] = box["shape_type"]
+                
+                # Bug 12: Only add segmentation when it has actual data
+                if i < len(segmentations) and segmentations[i] and len(segmentations[i]) > 0:
                     ann_entry["segmentation"] = segmentations[i]
                     # Recalculate area from segmentation polygon
-                    if segmentations[i] and len(segmentations[i]) > 0:
-                        poly = segmentations[i][0]
-                        if len(poly) >= 6:  # At least 3 points
-                            # Calculate polygon area using shoelace formula
-                            n = len(poly) // 2
-                            area = 0
-                            for j in range(n):
-                                x1, y1 = poly[2*j], poly[2*j + 1]
-                                x2, y2 = poly[2*((j+1) % n)], poly[2*((j+1) % n) + 1]
-                                area += x1 * y2 - x2 * y1
-                            ann_entry["area"] = abs(area) / 2
+                    poly = segmentations[i][0]
+                    if poly and len(poly) >= 6:
+                        n = len(poly) // 2
+                        area = 0
+                        for j in range(n):
+                            x1_p, y1_p = poly[2*j], poly[2*j + 1]
+                            x2_p, y2_p = poly[2*((j+1) % n)], poly[2*((j+1) % n) + 1]
+                            area += x1_p * y2_p - x2_p * y1_p
+                        ann_entry["area"] = abs(area) / 2
                 else:
                     # Use bbox as segmentation fallback (4 corner points)
-                    x1, y1 = box.get("x1", x), box.get("y1", y)
-                    x2, y2 = box.get("x2", x + w), box.get("y2", y + h)
+                    x1 = box.get("x1", x)
+                    y1 = box.get("y1", y)
+                    x2 = box.get("x2", x + w)
+                    y2 = box.get("y2", y + h)
                     ann_entry["segmentation"] = [[x1, y1, x2, y1, x2, y2, x1, y2]]
                 
                 coco_data["annotations"].append(ann_entry)
@@ -189,7 +194,7 @@ class ExportService:
         with open(export_dir / "classes.txt", 'w') as f:
             f.write('\n'.join(class_names))
         
-        # Create data.yaml
+        # Bug 11: Use proper yaml import (no fallback class)
         data_yaml = {
             "path": ".",
             "train": "images",
@@ -197,7 +202,6 @@ class ExportService:
             "names": {i: name for i, name in enumerate(class_names)}
         }
         with open(export_dir / "data.yaml", 'w') as f:
-            import yaml
             yaml.dump(data_yaml, f)
         
         # Create label files
@@ -268,6 +272,10 @@ class ExportService:
                 
                 if i < len(scores):
                     ET.SubElement(obj, "confidence").text = str(scores[i])
+                
+                # Include shape_type if available
+                if "shape_type" in box:
+                    ET.SubElement(obj, "shape_type").text = box["shape_type"]
                 
                 bndbox = ET.SubElement(obj, "bndbox")
                 ET.SubElement(bndbox, "xmin").text = str(int(box["x1"]))
@@ -362,20 +370,3 @@ model.train(data='data.yaml')
         
         with open(export_dir / "README.md", 'w') as f:
             f.write(readme)
-
-
-# YAML support for YOLO export
-try:
-    import yaml
-except ImportError:
-    # Simple YAML writer fallback
-    class yaml:
-        @staticmethod
-        def dump(data, f):
-            for key, value in data.items():
-                if isinstance(value, dict):
-                    f.write(f"{key}:\n")
-                    for k, v in value.items():
-                        f.write(f"  {k}: {v}\n")
-                else:
-                    f.write(f"{key}: {value}\n")

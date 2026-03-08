@@ -11,6 +11,7 @@ build/
 backend/models/*.pth
 backend/uploads/
 backend/outputs/
+backend/temp/
 *.log
 .gemini/
 test_data

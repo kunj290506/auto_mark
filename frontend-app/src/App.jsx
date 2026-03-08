@@ -13,8 +13,8 @@ function App() {
   const [session, setSession] = useState(null)
   const [config, setConfig] = useState({
     objects: [],
-    boxThreshold: 0.15,
-    textThreshold: 0.15,
+    boxThreshold: 0.25,
+    textThreshold: 0.20,
     useSam: true,
     exportFormat: 'coco'
   })

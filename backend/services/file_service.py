@@ -50,6 +50,10 @@ class FileService:
                     if member.endswith('/') or member.startswith('__MACOSX'):
                         continue
                     
+                    # Bug 14: Security - block path traversal
+                    if os.path.isabs(member) or '..' in member or member.startswith('/'):
+                        continue
+                    
                     # Check if it's an image
                     ext = Path(member).suffix.lower()
                     if ext in self.ALLOWED_EXTENSIONS:
@@ -100,12 +104,13 @@ class FileService:
         if zip_path.exists():
             os.remove(zip_path)
     
+    # Bug 13: Use img.load() instead of img.verify()
     def validate_image(self, image_path: str) -> bool:
         """Validate that file is a valid image"""
         try:
             from PIL import Image
             with Image.open(image_path) as img:
-                img.verify()
+                img.load()
             return True
         except Exception:
             return False
