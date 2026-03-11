@@ -1,128 +1,104 @@
-"""
-Auto Annotation Tool - Backend Server
-FastAPI application with WebSocket support for real-time annotation progress.
-"""
+"""FastAPI backend for SAM2-powered auto-annotation and YOLO dataset export."""
 
-import os
-import re
-import uuid
-import asyncio
+import io
+import shutil
+import tempfile
 import time
+import uuid
+import zipfile
 from pathlib import Path
-from typing import Optional
-from contextlib import asynccontextmanager
+from typing import Dict, List, Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
+import cv2
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
-from services.file_service import FileService
-from services.annotation_service import AnnotationService
-from services.export_service import ExportService
-from session_store import save_session, load_session, delete_session as store_delete_session, list_all_sessions, session_exists
-
-# Configuration
-UPLOAD_DIR = Path("uploads")
-OUTPUT_DIR = Path("outputs")
-TEMP_DIR = Path("temp")
-
-# Create directories
-for dir_path in [UPLOAD_DIR, OUTPUT_DIR, TEMP_DIR]:
-    dir_path.mkdir(exist_ok=True)
-
-# Initialize services
-file_service = FileService(UPLOAD_DIR, TEMP_DIR)
-annotation_service = AnnotationService()
-export_service = ExportService(OUTPUT_DIR)
-
-# WebSocket connections
-ws_connections = {}
+from services.dataset_service import DatasetService
+from services.project_service import ALLOWED_EXTENSIONS, ProjectService
+from services.sam2_service import SAM2Service
 
 
-def extract_label_from_filename(filename: str) -> str:
-    """
-    Extract a clean label from an image filename.
-    Examples:
-        'air_conditioner_1.jpg' -> 'air conditioner'
-        'applesauce_001.png' -> 'applesauce'
-        'PersonWalking.jpeg' -> 'person walking'
-    """
-    # Remove extension
-    name = Path(filename).stem
-    
-    # Remove trailing numbers (e.g., _1, _001, 01)
-    name = re.sub(r'[_\-]?\d+$', '', name)
-    
-    # Handle camelCase and PascalCase
-    name = re.sub(r'([a-z])([A-Z])', r'\1 \2', name)
-    
-    # Replace underscores and dashes with spaces
-    name = name.replace('_', ' ').replace('-', ' ')
-    
-    # Clean up multiple spaces and strip
-    name = re.sub(r'\s+', ' ', name).strip().lower()
-    
-    return name if name else 'object'
+BASE_DIR = Path(__file__).resolve().parent
+PROJECTS_DIR = BASE_DIR / "projects"
+MODELS_DIR = BASE_DIR / "models"
+
+project_service = ProjectService(PROJECTS_DIR)
+sam2_service = SAM2Service(MODELS_DIR)
+dataset_service = DatasetService(sam2_service)
+
+JOBS: Dict[str, Dict] = {}
 
 
-class AnnotationConfig(BaseModel):
-    """Configuration for annotation job"""
-    objects: list[str]
-    box_threshold: float = 0.25
-    text_threshold: float = 0.20
-    use_sam: bool = True
-    export_format: str = "coco"
-    min_box_size: int = 10
-    nms_threshold: float = 0.5
-    remove_overlaps: bool = True
+class ProjectCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
 
 
-class SessionInfo(BaseModel):
-    """Session information"""
-    session_id: str
-    status: str
-    image_count: int
-    processed_count: int
-    annotations: Optional[dict] = None
+class AutoAnnotateRequest(BaseModel):
+    image_id: Optional[str] = None
+    confidence_threshold: float = Field(default=0.5, ge=0.5, le=1.0)
+    min_mask_area_ratio: float = Field(default=0.001, ge=0.0, le=1.0)
+    max_mask_area_ratio: float = Field(default=0.95, ge=0.0, le=1.0)
+    auto_class: bool = False
 
 
-# Bug 10: Cleanup old sessions (24hr TTL)
-async def cleanup_old_sessions():
-    """Remove sessions older than 24 hours"""
-    while True:
-        await asyncio.sleep(3600)  # Check every hour
-        now = time.time()
-        all_sessions = list_all_sessions()
-        for sid, session in all_sessions:
-            if now - session.get("created_at", now) > 86400:
-                store_delete_session(sid)
-                await file_service.cleanup_session(sid)
-                print(f"[INFO] Cleaned up expired session: {sid}")
+class PointPromptRequest(BaseModel):
+    image_id: str
+    x: float
+    y: float
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan handler"""
-    print("[INFO] Auto Annotation Tool Backend Starting...")
-    print("[INFO] Upload directory:", UPLOAD_DIR.absolute())
-    print("[INFO] Output directory:", OUTPUT_DIR.absolute())
-    # Bug 10: Start cleanup task
-    cleanup_task = asyncio.create_task(cleanup_old_sessions())
-    yield
-    cleanup_task.cancel()
-    print("[INFO] Shutting down...")
+class BoxPromptRequest(BaseModel):
+    image_id: str
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+
+class AnnotationUpdateRequest(BaseModel):
+    masks: List[Dict]
+    history: List[Dict] = []
+
+
+class ClassUpsertRequest(BaseModel):
+    name: str
+    color: Optional[str] = None
+
+
+class ClassRenameRequest(BaseModel):
+    class_id: str
+    new_name: str
+
+
+class ClassMergeRequest(BaseModel):
+    source_class_id: str
+    target_class_id: str
+
+
+class ShortcutAssignRequest(BaseModel):
+    class_id: str
+    shortcut: int = Field(ge=1, le=9)
+
+
+class ExportRequest(BaseModel):
+    task: str = Field(default="segment")
+    val_ratio: float = Field(default=0.2, ge=0.05, le=0.5)
+    augmentations: Dict = {}
+
+
+class AugPreviewRequest(BaseModel):
+    image_id: str
+    augmentations: Dict = {}
 
 
 app = FastAPI(
-    title="Auto Annotation Tool",
-    description="Automated image annotation using Grounding DINO",
-    version="1.0.0",
-    lifespan=lifespan
+    title="AutoMark SAM2 API",
+    description="Production-oriented backend for SAM2 auto-annotation and YOLO export",
+    version="2.0.0",
 )
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -131,302 +107,504 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static files for serving processed images
-app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
-app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
-
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
     return {
-        "name": "Auto Annotation Tool API",
-        "version": "1.0.0",
-        "status": "running"
+        "name": "AutoMark SAM2 API",
+        "status": "running",
+        "projects_dir": str(PROJECTS_DIR),
     }
 
 
 @app.get("/api/health")
 async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "gpu_available": annotation_service.gpu_available}
-
-
-@app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...)):
-    """
-    Upload a zip file containing images for annotation.
-    Returns session ID and image preview information.
-    """
-    if not file.filename.endswith('.zip'):
-        raise HTTPException(status_code=400, detail="Only zip files are supported")
-    
-    # Create new session
-    session_id = str(uuid.uuid4())
-    
-    try:
-        # Save and extract zip file
-        result = await file_service.process_upload(file, session_id)
-        
-        # Bug 8: Store session with shelve + Bug 10: Add created_at
-        session_data = {
-            "status": "uploaded",
-            "image_count": result["image_count"],
-            "images": result["images"],
-            "processed_count": 0,
-            "annotations": {},
-            "created_at": time.time()
-        }
-        save_session(session_id, session_data)
-        
-        return {
-            "session_id": session_id,
-            "image_count": result["image_count"],
-            "images": result["images"][:20],  # Preview first 20 images
-            "message": f"Successfully uploaded {result['image_count']} images"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/annotate/{session_id}")
-async def start_annotation(session_id: str, config: AnnotationConfig):
-    """
-    Start annotation process for uploaded images.
-    Uses WebSocket for real-time progress updates.
-    """
-    # Bug 8: Use persistent session store
-    session = load_session(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    if session["status"] == "processing":
-        raise HTTPException(status_code=400, detail="Annotation already in progress")
-    
-    session["status"] = "processing"
-    session["config"] = config.model_dump()
-    save_session(session_id, session)
-    
-    # Bug 9: Start annotation in background with error callback
-    task = asyncio.create_task(
-        run_annotation(session_id, session["images"], config)
-    )
-    task.add_done_callback(
-        lambda t: print(f"[ERROR] Annotation task failed: {t.exception()}") if not t.cancelled() and t.exception() else None
-    )
-    
     return {
-        "session_id": session_id,
-        "status": "processing",
-        "message": "Annotation started"
+        "status": "healthy",
+        "gpu_available": bool(cv2.cuda.getCudaEnabledDeviceCount() > 0) if hasattr(cv2, "cuda") else False,
+        "sam2_loaded": sam2_service.loaded,
+        "sam2_error": sam2_service.load_error,
+        "sam2_device": sam2_service.runtime.device,
     }
 
 
-async def run_annotation(session_id: str, images: list, config: AnnotationConfig):
-    """Background task for running annotation"""
-    session = load_session(session_id)
-    if session is None:
-        return
-    
-    total = len(images)
-    
+@app.get("/api/projects")
+async def list_projects():
+    projects = project_service.list_projects()
+    return {"projects": projects}
+
+
+@app.post("/api/projects")
+async def create_project(payload: ProjectCreateRequest):
+    project = project_service.create_project(payload.name)
+    return project
+
+
+@app.get("/api/projects/{project_id}")
+async def get_project(project_id: str):
     try:
-        for i, image_path in enumerate(images):
-            # Extract label from filename for contextual detection
-            filename = os.path.basename(image_path)
-            filename_label = extract_label_from_filename(filename)
-            
-            # Always use filename as detection label (image name IS the object)
-            if config.objects and config.objects[0].lower() not in ('object', 'objects', 'item', 'items'):
-                detection_labels = list(set([filename_label] + config.objects))
-            else:
-                detection_labels = [filename_label]
-            
-            # Run annotation on image with contextual label
-            result = await annotation_service.annotate_image(
-                image_path,
-                detection_labels,
-                config.box_threshold,
-                config.text_threshold,
-                config.use_sam,
-                config.nms_threshold,
-                config.min_box_size
+        project = project_service.get_project(project_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    images = project_service.list_images(project_id)
+    classes = project_service.list_classes(project_id)
+    return {"project": project, "images": images, "classes": classes}
+
+
+@app.post("/api/projects/{project_id}/upload/images")
+async def upload_images(project_id: str, files: List[UploadFile] = File(...)):
+    project_dir = PROJECTS_DIR / project_id
+    if not project_dir.exists():
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        temp_paths: List[Path] = []
+        for file in files:
+            suffix = Path(file.filename or "").suffix.lower()
+            if suffix not in ALLOWED_EXTENSIONS:
+                continue
+            safe_name = f"{uuid.uuid4()}{suffix}"
+            target = Path(tmp) / safe_name
+            content = await file.read()
+            target.write_bytes(content)
+            temp_paths.append(target)
+
+        added = project_service.add_images_from_paths(project_id, temp_paths)
+
+    return {"added": added, "count": len(added)}
+
+
+@app.post("/api/projects/{project_id}/upload/zip")
+async def upload_zip(project_id: str, file: UploadFile = File(...)):
+    if not (file.filename or "").lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only .zip files are supported")
+
+    project_dir = PROJECTS_DIR / project_id
+    if not project_dir.exists():
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        zip_path = Path(tmp) / "images.zip"
+        zip_path.write_bytes(await file.read())
+
+        extracted_paths: List[Path] = []
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for member in zf.namelist():
+                if member.endswith("/"):
+                    continue
+                member_path = Path(member)
+                if member_path.suffix.lower() not in ALLOWED_EXTENSIONS:
+                    continue
+                if member_path.is_absolute() or ".." in member_path.parts:
+                    continue
+
+                target = Path(tmp) / f"{uuid.uuid4()}{member_path.suffix.lower()}"
+                with zf.open(member) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                extracted_paths.append(target)
+
+        added = project_service.add_images_from_paths(project_id, extracted_paths)
+
+    return {"added": added, "count": len(added)}
+
+
+@app.get("/api/projects/{project_id}/images")
+async def list_images(project_id: str):
+    try:
+        images = project_service.list_images(project_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"images": images}
+
+
+@app.get("/api/projects/{project_id}/images/{image_id}")
+async def serve_image(project_id: str, image_id: str):
+    try:
+        image_path = project_service.get_image_path(project_id, image_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    if not image_path.exists():
+        raise HTTPException(status_code=404, detail="Image file missing")
+    return FileResponse(image_path)
+
+
+@app.get("/api/projects/{project_id}/annotations/{image_id}")
+async def get_annotation(project_id: str, image_id: str):
+    try:
+        annotation = project_service.load_annotation(project_id, image_id)
+        return annotation
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.put("/api/projects/{project_id}/annotations/{image_id}")
+async def update_annotation(project_id: str, image_id: str, payload: AnnotationUpdateRequest):
+    try:
+        image = project_service.get_image(project_id, image_id)
+        annotation = {
+            "image_id": image_id,
+            "filename": image["filename"],
+            "width": image["width"],
+            "height": image["height"],
+            "masks": payload.masks,
+            "history": payload.history,
+            "updated_at": time.time(),
+        }
+        project_service.save_annotation(project_id, image_id, annotation)
+        return annotation
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.delete("/api/projects/{project_id}/annotations/{image_id}/masks/{mask_id}")
+async def delete_mask(project_id: str, image_id: str, mask_id: str):
+    try:
+        annotation = project_service.load_annotation(project_id, image_id)
+        annotation["masks"] = [mask for mask in annotation.get("masks", []) if mask.get("id") != mask_id]
+        project_service.save_annotation(project_id, image_id, annotation)
+        return {"ok": True, "mask_count": len(annotation["masks"])}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/api/projects/{project_id}/annotate/auto")
+async def auto_annotate_single(project_id: str, payload: AutoAnnotateRequest):
+    if not payload.image_id:
+        raise HTTPException(status_code=400, detail="image_id is required")
+
+    try:
+        image = project_service.get_image(project_id, payload.image_id)
+        project_service.set_image_status(project_id, payload.image_id, "annotating")
+        result = sam2_service.auto_annotate(
+            image_path=project_service.get_image_path(project_id, payload.image_id),
+            confidence_threshold=payload.confidence_threshold,
+            min_mask_area_ratio=payload.min_mask_area_ratio,
+            max_mask_area_ratio=payload.max_mask_area_ratio,
+        )
+
+        masks = result["masks"]
+        if payload.auto_class:
+            for mask in masks:
+                suggested = sam2_service.suggest_class(mask)
+                mask["class_name"] = suggested
+                project_service.upsert_class(project_id, suggested)
+
+        annotation = {
+            "image_id": payload.image_id,
+            "filename": image["filename"],
+            "width": result["width"],
+            "height": result["height"],
+            "masks": masks,
+            "history": [],
+            "updated_at": time.time(),
+        }
+        project_service.save_annotation(project_id, payload.image_id, annotation)
+        return annotation
+    except Exception as exc:
+        project_service.log_error(project_id, f"Auto-annotate failed for {payload.image_id}: {exc}")
+        project_service.set_image_status(project_id, payload.image_id, "unannotated")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+async def _run_batch_auto_annotate(project_id: str, image_ids: List[str], req: AutoAnnotateRequest, job_id: str):
+    start = time.time()
+    processed = 0
+
+    for image_id in image_ids:
+        item_start = time.time()
+        try:
+            project_service.set_image_status(project_id, image_id, "annotating")
+            image = project_service.get_image(project_id, image_id)
+            result = sam2_service.auto_annotate(
+                image_path=project_service.get_image_path(project_id, image_id),
+                confidence_threshold=req.confidence_threshold,
+                min_mask_area_ratio=req.min_mask_area_ratio,
+                max_mask_area_ratio=req.max_mask_area_ratio,
             )
-            
-            # Bug 8: Store result with persistent sessions
-            session = load_session(session_id)
-            if session is None:
-                return
-            session["annotations"][image_path] = result
-            session["processed_count"] = i + 1
-            save_session(session_id, session)
-            
-            # Send WebSocket update
-            if session_id in ws_connections:
-                try:
-                    await ws_connections[session_id].send_json({
-                        "type": "progress",
-                        "current": i + 1,
-                        "total": total,
-                        "percentage": round((i + 1) / total * 100, 1),
-                        "current_image": image_path,
-                        "detections": len(result.get("boxes", []))
-                    })
-                except Exception:
-                    pass  # WebSocket may have closed
-            
-            # Yield to other tasks without unnecessary delay
-            await asyncio.sleep(0)
-        
-        session = load_session(session_id)
-        if session is None:
-            return
-        session["status"] = "completed"
-        save_session(session_id, session)
-        
-        # Send completion message
-        if session_id in ws_connections:
-            try:
-                await ws_connections[session_id].send_json({
-                    "type": "completed",
-                    "total_images": total,
-                    "total_detections": sum(
-                        len(ann.get("boxes", [])) 
-                        for ann in session["annotations"].values()
-                    )
-                })
-            except Exception:
-                pass
-            
-    except Exception as e:
-        session = load_session(session_id)
-        if session is not None:
-            session["status"] = "error"
-            session["error"] = str(e)
-            save_session(session_id, session)
-        
-        if session_id in ws_connections:
-            try:
-                await ws_connections[session_id].send_json({
-                    "type": "error",
-                    "message": str(e)
-                })
-            except Exception:
-                pass
+
+            masks = result["masks"]
+            if req.auto_class:
+                for mask in masks:
+                    suggested = sam2_service.suggest_class(mask)
+                    mask["class_name"] = suggested
+                    project_service.upsert_class(project_id, suggested)
+
+            annotation = {
+                "image_id": image_id,
+                "filename": image["filename"],
+                "width": result["width"],
+                "height": result["height"],
+                "masks": masks,
+                "history": [],
+                "updated_at": time.time(),
+            }
+            project_service.save_annotation(project_id, image_id, annotation)
+            JOBS[job_id]["processed"] += 1
+            JOBS[job_id]["last_image"] = image["filename"]
+        except Exception as exc:
+            JOBS[job_id]["skipped"] += 1
+            JOBS[job_id]["errors"].append({"image_id": image_id, "error": str(exc)})
+            project_service.log_error(project_id, f"Batch annotate failed for {image_id}: {exc}")
+            project_service.set_image_status(project_id, image_id, "unannotated")
+
+        processed += 1
+        elapsed = time.time() - start
+        avg = elapsed / processed if processed else 0
+        remaining = max(0, len(image_ids) - processed)
+        JOBS[job_id]["progress"] = round(100 * processed / len(image_ids), 2)
+        JOBS[job_id]["eta_seconds"] = int(avg * remaining)
+        JOBS[job_id]["elapsed_seconds"] = int(elapsed)
+        JOBS[job_id]["last_image_duration_ms"] = int((time.time() - item_start) * 1000)
+
+    JOBS[job_id]["status"] = "completed"
 
 
-@app.get("/api/status/{session_id}")
-async def get_status(session_id: str):
-    """Get current status of annotation session"""
-    session = load_session(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    # Calculate detections found so far
-    total_detections = sum(len(ann.get("boxes", [])) for ann in session.get("annotations", {}).values())
-    
-    return {
-        "session_id": session_id,
-        "status": session["status"],
-        "image_count": session["image_count"],
-        "processed_count": session["processed_count"],
-        "total_detections": total_detections,
-        "progress": round(session["processed_count"] / session["image_count"] * 100, 1)
-            if session["image_count"] > 0 else 0
-    }
-
-
-@app.get("/api/annotations/{session_id}")
-async def get_annotations(session_id: str):
-    """Get all annotations for a session"""
-    session = load_session(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    return {
-        "session_id": session_id,
-        "status": session["status"],
-        "annotations": session["annotations"],
-        "images": session["images"]
-    }
-
-
-@app.post("/api/export/{session_id}")
-async def export_annotations(session_id: str, format: str = "coco"):
-    """
-    Export annotations in the specified format.
-    Supported formats: coco, yolo, voc, roboflow
-    """
-    session = load_session(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    if session["status"] != "completed":
-        raise HTTPException(status_code=400, detail="Annotation not completed yet")
-    
+@app.post("/api/projects/{project_id}/annotate/auto/batch")
+async def auto_annotate_batch(project_id: str, payload: AutoAnnotateRequest, background_tasks: BackgroundTasks):
     try:
-        export_path = await export_service.export(
-            session_id,
-            session["annotations"],
-            session["images"],
-            format
+        images = project_service.list_images(project_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    image_ids = [item["id"] for item in images]
+    if not image_ids:
+        raise HTTPException(status_code=400, detail="No images uploaded")
+
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {
+        "id": job_id,
+        "project_id": project_id,
+        "status": "running",
+        "processed": 0,
+        "skipped": 0,
+        "total": len(image_ids),
+        "progress": 0.0,
+        "eta_seconds": None,
+        "elapsed_seconds": 0,
+        "last_image": None,
+        "last_image_duration_ms": None,
+        "errors": [],
+    }
+
+    background_tasks.add_task(_run_batch_auto_annotate, project_id, image_ids, payload, job_id)
+    return JOBS[job_id]
+
+
+@app.get("/api/jobs/{job_id}")
+async def job_status(job_id: str):
+    if job_id not in JOBS:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return JOBS[job_id]
+
+
+@app.post("/api/projects/{project_id}/annotate/point")
+async def annotate_by_point(project_id: str, payload: PointPromptRequest):
+    try:
+        annotation = project_service.load_annotation(project_id, payload.image_id)
+        mask = sam2_service.prompt_by_point(
+            image_path=project_service.get_image_path(project_id, payload.image_id),
+            x=payload.x,
+            y=payload.y,
         )
-        
-        return FileResponse(
-            export_path,
-            media_type="application/zip",
-            filename=f"annotations_{session_id}_{format}.zip"
+        if mask is None:
+            raise HTTPException(status_code=404, detail="No mask found for that point")
+
+        annotation.setdefault("masks", []).append(mask)
+        annotation["updated_at"] = time.time()
+        project_service.save_annotation(project_id, payload.image_id, annotation)
+        return annotation
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/api/projects/{project_id}/annotate/box")
+async def annotate_by_box(project_id: str, payload: BoxPromptRequest):
+    try:
+        annotation = project_service.load_annotation(project_id, payload.image_id)
+        mask = sam2_service.prompt_by_box(
+            image_path=project_service.get_image_path(project_id, payload.image_id),
+            box=[payload.x1, payload.y1, payload.x2, payload.y2],
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        if mask is None:
+            raise HTTPException(status_code=404, detail="No mask found for that box")
+
+        annotation.setdefault("masks", []).append(mask)
+        annotation["updated_at"] = time.time()
+        project_service.save_annotation(project_id, payload.image_id, annotation)
+        return annotation
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
 
 
-@app.get("/api/formats")
-async def get_export_formats():
-    """Get available export formats"""
+@app.get("/api/projects/{project_id}/classes")
+async def list_classes(project_id: str):
+    try:
+        classes = project_service.list_classes(project_id)
+        return {"classes": classes}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/api/projects/{project_id}/classes")
+async def create_or_update_class(project_id: str, payload: ClassUpsertRequest):
+    cls = project_service.upsert_class(project_id, payload.name, payload.color)
+    return cls
+
+
+@app.post("/api/projects/{project_id}/classes/shortcut")
+async def assign_shortcut(project_id: str, payload: ShortcutAssignRequest):
+    try:
+        project_service.assign_shortcut(project_id, payload.class_id, payload.shortcut)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"ok": True}
+
+
+@app.post("/api/projects/{project_id}/classes/rename")
+async def rename_class(project_id: str, payload: ClassRenameRequest):
+    try:
+        project_service.rename_class(project_id, payload.class_id, payload.new_name)
+        return {"ok": True}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/api/projects/{project_id}/classes/merge")
+async def merge_classes(project_id: str, payload: ClassMergeRequest):
+    try:
+        project_service.merge_classes(project_id, payload.source_class_id, payload.target_class_id)
+        return {"ok": True}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.delete("/api/projects/{project_id}/classes/{class_id}")
+async def delete_class(project_id: str, class_id: str):
+    project_service.delete_class(project_id, class_id)
+    return {"ok": True}
+
+
+@app.get("/api/projects/{project_id}/stats")
+async def dataset_stats(project_id: str):
+    try:
+        images = project_service.list_images(project_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    annotations = project_service.all_annotations(project_id)
+    classes = project_service.list_classes(project_id)
+
+    annotated = 0
+    total_objects = 0
+    per_class: Dict[str, int] = {}
+
+    for image in images:
+        ann = annotations.get(image["id"], {})
+        masks = ann.get("masks", [])
+        labeled = [m for m in masks if m.get("class_name") and m.get("class_name") != "unlabeled"]
+        if labeled:
+            annotated += 1
+        total_objects += len(labeled)
+        for mask in labeled:
+            cls = mask["class_name"]
+            per_class[cls] = per_class.get(cls, 0) + 1
+
+    warnings: List[str] = []
+    for cls, count in per_class.items():
+        if count < 50:
+            warnings.append(f"Class '{cls}' has only {count} examples - add at least 50")
+
+    if per_class:
+        sorted_pairs = sorted(per_class.items(), key=lambda kv: kv[1], reverse=True)
+        largest = sorted_pairs[0]
+        smallest = sorted_pairs[-1]
+        if smallest[1] > 0 and largest[1] / smallest[1] >= 3.0:
+            warnings.append(
+                f"Class imbalance detected - {largest[0]}({largest[1]}) vs {smallest[0]}({smallest[1]})"
+            )
+
     return {
-        "formats": [
-            {"id": "coco", "name": "COCO JSON", "description": "Single JSON file with all annotations"},
-            {"id": "yolo", "name": "YOLO", "description": "Separate .txt files per image"},
-            {"id": "voc", "name": "Pascal VOC", "description": "XML files for each image"},
-            {"id": "roboflow", "name": "Roboflow", "description": "Roboflow-compatible format"}
-        ]
+        "total_images": len(images),
+        "annotated_images": annotated,
+        "remaining_images": len(images) - annotated,
+        "average_objects_per_image": round(total_objects / max(1, len(images)), 2),
+        "per_class": per_class,
+        "known_classes": classes,
+        "warnings": warnings,
     }
 
 
-@app.websocket("/ws/{session_id}")
-async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    """WebSocket endpoint for real-time progress updates"""
-    await websocket.accept()
-    ws_connections[session_id] = websocket
-    
+@app.post("/api/projects/{project_id}/augment/preview")
+async def augmentation_preview(project_id: str, payload: AugPreviewRequest):
     try:
-        while True:
-            # Keep connection alive and listen for messages
-            data = await websocket.receive_text()
-            
-            if data == "ping":
-                await websocket.send_json({"type": "pong"})
-                
-    except WebSocketDisconnect:
-        if session_id in ws_connections:
-            del ws_connections[session_id]
+        annotation = project_service.load_annotation(project_id, payload.image_id)
+        image_path = project_service.get_image_path(project_id, payload.image_id)
+        img = dataset_service.preview_augmentation(image_path, annotation.get("masks", []), payload.augmentations)
+        ok, encoded = cv2.imencode(".jpg", img)
+        if not ok:
+            raise ValueError("Failed to encode preview image")
+        return StreamingResponse(io.BytesIO(encoded.tobytes()), media_type="image/jpeg")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.delete("/api/session/{session_id}")
-async def delete_session_endpoint(session_id: str):
-    """Delete a session and its associated files"""
-    if not session_exists(session_id):
-        raise HTTPException(status_code=404, detail="Session not found")
-    
+@app.post("/api/projects/{project_id}/export")
+async def export_dataset(project_id: str, payload: ExportRequest):
+    if payload.task not in {"segment", "detect"}:
+        raise HTTPException(status_code=400, detail="task must be 'segment' or 'detect'")
+
     try:
-        await file_service.cleanup_session(session_id)
-        store_delete_session(session_id)
-        return {"message": "Session deleted successfully"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        project = project_service.get_project(project_id)
+        classes = project_service.list_classes(project_id)
+        annotations = project_service.all_annotations(project_id)
+        project_dir = PROJECTS_DIR / project_id
+
+        result = dataset_service.export_dataset(
+            project_dir=project_dir,
+            project_data=project,
+            annotations_by_image_id=annotations,
+            classes=classes,
+            export_task=payload.task,
+            val_ratio=payload.val_ratio,
+            augmentations=payload.augmentations,
+        )
+
+        return {
+            "download_url": f"/api/projects/{project_id}/export/download",
+            "stats": result["stats"],
+        }
+    except Exception as exc:
+        project_service.log_error(project_id, f"Export failed: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/projects/{project_id}/export/download")
+async def download_export(project_id: str):
+    zip_path = PROJECTS_DIR / project_id / "exports" / "dataset_export.zip"
+    if not zip_path.exists():
+        raise HTTPException(status_code=404, detail="Export ZIP not found")
+    return FileResponse(zip_path, filename=f"{project_id}_dataset_export.zip", media_type="application/zip")
+
+
+@app.get("/api/projects/{project_id}/export/coco")
+async def download_coco_json(project_id: str):
+    coco_path = PROJECTS_DIR / project_id / "exports" / "dataset" / "coco_annotations.json"
+    if not coco_path.exists():
+        raise HTTPException(status_code=404, detail="COCO JSON not found")
+    return FileResponse(coco_path, filename=f"{project_id}_coco_annotations.json", media_type="application/json")
+
+
+@app.delete("/api/projects/{project_id}")
+async def delete_project(project_id: str):
+    project_dir = PROJECTS_DIR / project_id
+    if not project_dir.exists():
+        raise HTTPException(status_code=404, detail="Project not found")
+    shutil.rmtree(project_dir)
+    return {"ok": True}
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
