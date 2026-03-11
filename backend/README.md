@@ -1,4 +1,4 @@
-# Auto Annotation Tool - Backend
+# AutoMark SAM2 Backend
 
 ## Setup
 
@@ -9,8 +9,15 @@ python main.py
 
 ## API Endpoints
 
-- `POST /api/upload` - Upload zip file
-- `POST /api/annotate` - Start annotation
-- `GET /api/status/{session_id}` - Get processing status
-- `GET /api/export/{session_id}` - Download annotations
-- `WS /ws/{session_id}` - Real-time progress updates
+- `POST /api/projects` - Create project
+- `GET /api/projects` - List projects
+- `POST /api/projects/{project_id}/upload/images` - Upload images
+- `POST /api/projects/{project_id}/upload/zip` - Upload ZIP
+- `POST /api/projects/{project_id}/annotate/auto` - Auto-annotate one image with SAM2
+- `POST /api/projects/{project_id}/annotate/auto/batch` - Batch auto-annotation
+- `GET /api/jobs/{job_id}` - Batch progress + ETA
+- `POST /api/projects/{project_id}/annotate/point` - Point prompt annotation
+- `POST /api/projects/{project_id}/annotate/box` - Box prompt annotation
+- `PUT /api/projects/{project_id}/annotations/{image_id}` - Save edited polygons
+- `POST /api/projects/{project_id}/export` - Build YOLO dataset + COCO export
+- `GET /api/projects/{project_id}/export/download` - Download export ZIP
