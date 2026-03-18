@@ -225,7 +225,7 @@ function ViewerPage({ session, annotations, onExport, onBack }) {
                 return Math.max(0.25, Math.min(5, z + delta))
             })
         }
-    }, [])
+    }, [setZoom])
 
     const getDetectionCount = (imgPath) => {
         const ann = annotations?.annotations?.[imgPath]

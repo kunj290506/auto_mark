@@ -102,14 +102,14 @@ function UploadPage({ onComplete }) {
                     if (xhr.status >= 200 && xhr.status < 300) {
                         try {
                             resolve(JSON.parse(xhr.responseText))
-                        } catch (e) {
+                        } catch {
                             reject(new Error('Invalid server response'))
                         }
                     } else {
                         try {
                             const errorData = JSON.parse(xhr.responseText)
                             reject(new Error(errorData.detail || 'Upload failed'))
-                        } catch (e) {
+                        } catch {
                             reject(new Error(`Upload failed: ${xhr.status}`))
                         }
                     }

@@ -1,6 +1,7 @@
 __pycache__/
 node_modules/
 venv/
+.venv/
 .env
 .DS_Store
 .vscode/
@@ -12,6 +13,7 @@ backend/models/*.pth
 backend/uploads/
 backend/outputs/
 backend/temp/
+backend/projects/
 *.log
 .gemini/
 test_data

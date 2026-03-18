@@ -122,7 +122,7 @@ function ProcessingPage({ session, config, onComplete, onCancel, onReset }) {
             }
 
             wsRef.current = ws
-        } catch (e) {
+        } catch {
             console.warn('WebSocket not available, using polling')
             startPollingFallback()
         }
