@@ -25,8 +25,7 @@ from PIL import Image
 from concurrent.futures import ThreadPoolExecutor
 
 # Model paths
-MODELS_DIR = Path(os.environ.get("MODELS_DIR", "./models"))
-SAM_CHECKPOINT = MODELS_DIR / "sam_vit_b_01ec64.pth"
+DEFAULT_MODELS_DIR = Path(os.environ.get("MODELS_DIR", "./models"))
 
 # Thread pool for running sync inference off the event loop (Bug 5)
 _executor = ThreadPoolExecutor(max_workers=1)
@@ -35,7 +34,7 @@ _executor = ThreadPoolExecutor(max_workers=1)
 class AnnotationService:
     """Service for running Grounding DINO + SAM annotations with high accuracy"""
     
-    def __init__(self):
+    def __init__(self, models_dir: Optional[Path] = None):
         self.processor = None
         self.model = None
         self.sam_predictor = None
@@ -43,12 +42,14 @@ class AnnotationService:
         self.gpu_available = torch.cuda.is_available()
         self._model_loaded = False
         self._sam_loaded = False
+        self.models_dir = Path(models_dir) if models_dir else DEFAULT_MODELS_DIR
+        self.sam_checkpoint = self.models_dir / "sam_vit_b_01ec64.pth"
         
         print(f"[INFO] Annotation Service initialized")
         print(f"   Device: {self.device}")
         print(f"   GPU Available: {self.gpu_available}")
-        print(f"   Models Directory: {MODELS_DIR.absolute()}")
-        print(f"   SAM Checkpoint: {SAM_CHECKPOINT}")
+        print(f"   Models Directory: {self.models_dir.absolute()}")
+        print(f"   SAM Checkpoint: {self.sam_checkpoint}")
         
         # Bug 2: Only use FP16 on CUDA
         self.use_fp16 = self.device == "cuda" and torch.cuda.is_available()
@@ -91,41 +92,25 @@ class AnnotationService:
             return True
             
         except Exception as e:
-            print(f"[WARN] Could not load Grounding DINO base, trying tiny fallback: {e}")
-            try:
-                from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
-                model_id = "IDEA-Research/grounding-dino-tiny"
-                print(f"[INFO] Falling back to Grounding DINO TINY ({model_id})...")
-                self.processor = AutoProcessor.from_pretrained(model_id)
-                self.model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id)
-                self.model = self.model.to(self.device)
-                # Bug 2: Only half on CUDA
-                if self.use_fp16:
-                    self.model = self.model.half()
-                self.model.eval()
-                self._model_loaded = True
-                print("[OK] Grounding DINO TINY loaded as fallback")
-                return True
-            except Exception as e2:
-                print(f"[ERROR] Could not load any Grounding DINO model: {e2}")
-                return False
+            print(f"[ERROR] Could not load Grounding DINO BASE model: {e}")
+            return False
     
     async def _load_sam(self):
         """Load SAM model for segmentation"""
         if self._sam_loaded:
             return True
         
-        if not SAM_CHECKPOINT.exists():
-            print(f"[WARN] SAM checkpoint not found at {SAM_CHECKPOINT}")
+        if not self.sam_checkpoint.exists():
+            print(f"[WARN] SAM checkpoint not found at {self.sam_checkpoint}")
             return False
         
         try:
             from segment_anything import sam_model_registry, SamPredictor
             
-            print(f"[INFO] Loading SAM from {SAM_CHECKPOINT}...")
+            print(f"[INFO] Loading SAM from {self.sam_checkpoint}...")
             
             # Load SAM model
-            sam = sam_model_registry["vit_b"](checkpoint=str(SAM_CHECKPOINT))
+            sam = sam_model_registry["vit_b"](checkpoint=str(self.sam_checkpoint))
             sam = sam.to(self.device)
             sam.eval()
             
@@ -137,6 +122,31 @@ class AnnotationService:
         except Exception as e:
             print(f"[WARN] Could not load SAM: {e}")
             return False
+
+    async def warmup(self, require_sam: bool = True) -> Optional[str]:
+        """Warm up Grounding DINO/SAM in the shared executor thread."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_executor, self._warmup_sync, require_sam)
+
+    def _warmup_sync(self, require_sam: bool = True) -> Optional[str]:
+        import asyncio as _asyncio
+
+        warmup_loop = _asyncio.new_event_loop()
+        try:
+            model_ready = warmup_loop.run_until_complete(self._load_model())
+            if not model_ready:
+                return "Grounding DINO Base model failed to load"
+
+            if require_sam:
+                sam_ready = warmup_loop.run_until_complete(self._load_sam())
+                if not sam_ready:
+                    return "SAM model checkpoint failed to load"
+
+            return None
+        except Exception as exc:
+            return str(exc)
+        finally:
+            warmup_loop.close()
     
     # Bug 5: async annotate_image delegates to sync pipeline via executor
     async def annotate_image(

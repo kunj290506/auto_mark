@@ -9,7 +9,7 @@ import time
 import uuid
 import zipfile
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import cv2
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel, Field
 
+from services.annotation_service import AnnotationService
 from services.dataset_service import DatasetService
 from services.project_service import ALLOWED_EXTENSIONS, ProjectService
 from services.sam2_service import SAM2Service
@@ -32,6 +33,7 @@ MODELS_DIR = BASE_DIR / "models"
 
 project_service = ProjectService(PROJECTS_DIR)
 sam2_service = SAM2Service(MODELS_DIR)
+annotation_service = AnnotationService(models_dir=MODELS_DIR)
 dataset_service = DatasetService(sam2_service)
 
 JOBS: Dict[str, Dict] = {}
@@ -69,13 +71,136 @@ def _safe_project_name(name: str) -> str:
     return cleaned
 
 
+def _normalize_label(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def _dedupe_objects(objects: List[str]) -> List[str]:
+    deduped: List[str] = []
+    seen = set()
+    for item in objects:
+        cleaned = (item or "").strip()
+        normalized = _normalize_label(cleaned)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(cleaned)
+    return deduped
+
+
+def _resolve_prompt_objects(project_id: str, requested_objects: List[str]) -> List[str]:
+    prompts = _dedupe_objects(requested_objects)
+    if prompts:
+        return prompts
+
+    classes = project_service.list_classes(project_id)
+    class_names = [str(cls.get("name", "")) for cls in classes]
+    return _dedupe_objects(class_names)
+
+
+def _polygon_area(polygon: List[List[float]]) -> float:
+    if len(polygon) < 3:
+        return 0.0
+
+    area = 0.0
+    for idx in range(len(polygon)):
+        x1, y1 = polygon[idx]
+        x2, y2 = polygon[(idx + 1) % len(polygon)]
+        area += x1 * y2 - x2 * y1
+    return abs(area) * 0.5
+
+
+def _flat_polygon_to_points(raw_polygon: Any) -> List[List[float]]:
+    if not isinstance(raw_polygon, list) or len(raw_polygon) < 6:
+        return []
+
+    points: List[List[float]] = []
+    for idx in range(0, len(raw_polygon) - 1, 2):
+        try:
+            x = float(raw_polygon[idx])
+            y = float(raw_polygon[idx + 1])
+        except (TypeError, ValueError):
+            return []
+        points.append([x, y])
+
+    return points if len(points) >= 3 else []
+
+
+def _polygon_from_detection(segmentation: Any, box: Dict[str, Any]) -> List[List[float]]:
+    best_polygon: List[List[float]] = []
+    best_area = 0.0
+
+    if isinstance(segmentation, list):
+        for candidate in segmentation:
+            points = _flat_polygon_to_points(candidate)
+            if not points:
+                continue
+            area = _polygon_area(points)
+            if area > best_area:
+                best_area = area
+                best_polygon = points
+
+    if best_polygon:
+        return best_polygon
+
+    x1 = float(box.get("x1", 0.0))
+    y1 = float(box.get("y1", 0.0))
+    x2 = float(box.get("x2", 0.0))
+    y2 = float(box.get("y2", 0.0))
+    return [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+
+
+def _bbox_from_detection(box: Dict[str, Any], image_width: int, image_height: int) -> Dict[str, float]:
+    x1 = max(0.0, min(float(box.get("x1", 0.0)), float(image_width)))
+    y1 = max(0.0, min(float(box.get("y1", 0.0)), float(image_height)))
+    x2 = max(0.0, min(float(box.get("x2", 0.0)), float(image_width)))
+    y2 = max(0.0, min(float(box.get("y2", 0.0)), float(image_height)))
+
+    w = max(0.0, x2 - x1)
+    h = max(0.0, y2 - y1)
+    safe_w = float(max(1, image_width))
+    safe_h = float(max(1, image_height))
+
+    return {
+        "x": x1,
+        "y": y1,
+        "w": w,
+        "h": h,
+        "cx": x1 + (w / 2.0),
+        "cy": y1 + (h / 2.0),
+        "x_norm": x1 / safe_w,
+        "y_norm": y1 / safe_h,
+        "w_norm": w / safe_w,
+        "h_norm": h / safe_h,
+    }
+
+
+def _resolve_detected_class_name(label: str, class_name_map: Dict[str, str]) -> str:
+    normalized = _normalize_label(label)
+    if not normalized:
+        return "unlabeled"
+
+    if normalized in class_name_map:
+        return class_name_map[normalized]
+
+    for known_norm, known_name in class_name_map.items():
+        if normalized in known_norm or known_norm in normalized:
+            return known_name
+
+    return label.strip() or "unlabeled"
+
+
 class ProjectCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
 
 
 class AutoAnnotateRequest(BaseModel):
     image_id: Optional[str] = None
-    confidence_threshold: float = Field(default=0.5, ge=0.5, le=1.0)
+    objects: List[str] = Field(default_factory=list)
+    confidence_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    text_threshold: float = Field(default=0.2, ge=0.0, le=1.0)
+    nms_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    min_box_size: int = Field(default=10, ge=1, le=2048)
     min_mask_area_ratio: float = Field(default=0.001, ge=0.0, le=1.0)
     max_mask_area_ratio: float = Field(default=0.95, ge=0.0, le=1.0)
     auto_class: bool = False
@@ -184,6 +309,8 @@ async def health_check():
         "sam2_loaded": sam2_service.loaded,
         "sam2_error": sam2_service.load_error,
         "sam2_device": sam2_service.runtime.device,
+        "grounding_dino_loaded": annotation_service._model_loaded,
+        "sam_vit_b_loaded": annotation_service._sam_loaded,
     }
 
 
@@ -368,11 +495,6 @@ async def auto_annotate_single(project_id: str, payload: AutoAnnotateRequest):
         )
 
         masks = result["masks"]
-        if payload.auto_class:
-            for mask in masks:
-                suggested = sam2_service.suggest_class(mask)
-                mask["class_name"] = suggested
-                project_service.upsert_class(project_id, suggested)
 
         annotation = {
             "image_id": payload.image_id,
@@ -394,31 +516,88 @@ async def auto_annotate_single(project_id: str, payload: AutoAnnotateRequest):
 async def _run_batch_auto_annotate(project_id: str, image_ids: List[str], req: AutoAnnotateRequest, job_id: str):
     start = time.time()
     processed = 0
+    class_name_map = {
+        _normalize_label(cls.get("name", "")): cls["name"]
+        for cls in project_service.list_classes(project_id)
+        if cls.get("name")
+    }
+
+    try:
+        warmup_error = await annotation_service.warmup(require_sam=True)
+        if warmup_error:
+            raise RuntimeError(warmup_error)
+    except Exception as exc:
+        JOBS[job_id]["status"] = "failed"
+        JOBS[job_id]["errors"].append({"image_id": None, "error": str(exc)})
+        project_service.log_error(project_id, f"Batch annotate warm-up failed: {exc}")
+        return
 
     for image_id in image_ids:
         item_start = time.time()
         try:
             project_service.set_image_status(project_id, image_id, "annotating")
             image = project_service.get_image(project_id, image_id)
-            result = sam2_service.auto_annotate(
-                image_path=project_service.get_image_path(project_id, image_id),
-                confidence_threshold=req.confidence_threshold,
-                min_mask_area_ratio=req.min_mask_area_ratio,
-                max_mask_area_ratio=req.max_mask_area_ratio,
+            result = await annotation_service.annotate_image(
+                image_path=str(project_service.get_image_path(project_id, image_id)),
+                objects=req.objects,
+                box_threshold=req.confidence_threshold,
+                text_threshold=req.text_threshold,
+                use_sam=True,
+                nms_threshold=req.nms_threshold,
+                min_box_size=req.min_box_size,
             )
 
-            masks = result["masks"]
-            if req.auto_class:
-                for mask in masks:
-                    suggested = sam2_service.suggest_class(mask)
-                    mask["class_name"] = suggested
-                    project_service.upsert_class(project_id, suggested)
+            if result.get("error"):
+                raise RuntimeError(str(result["error"]))
+
+            image_size = result.get("image_size", {})
+            width = int(image_size.get("width") or image.get("width") or 0)
+            height = int(image_size.get("height") or image.get("height") or 0)
+            if width <= 0 or height <= 0:
+                raise RuntimeError("Invalid image dimensions from annotation pipeline")
+
+            boxes = result.get("boxes", [])
+            labels = result.get("labels", [])
+            scores = result.get("scores", [])
+            segmentations = result.get("segmentations", [])
+            image_area = float(max(1, width * height))
+
+            masks: List[Dict[str, Any]] = []
+            for idx, box in enumerate(boxes):
+                polygon = _polygon_from_detection(
+                    segmentations[idx] if idx < len(segmentations) else None,
+                    box,
+                )
+                area_ratio = _polygon_area(polygon) / image_area
+
+                if area_ratio < req.min_mask_area_ratio or area_ratio > req.max_mask_area_ratio:
+                    continue
+
+                raw_label = str(labels[idx]) if idx < len(labels) else "unlabeled"
+                class_name = _resolve_detected_class_name(raw_label, class_name_map)
+                if class_name != "unlabeled":
+                    stored_class = project_service.upsert_class(project_id, class_name)
+                    class_name_map[_normalize_label(stored_class["name"])] = stored_class["name"]
+                    class_name = stored_class["name"]
+
+                masks.append(
+                    {
+                        "id": str(uuid.uuid4()),
+                        "class_name": class_name,
+                        "score": float(scores[idx]) if idx < len(scores) else 0.0,
+                        "area_ratio": float(area_ratio),
+                        "polygon": polygon,
+                        "bbox": _bbox_from_detection(box, width, height),
+                        "source": "grounding_dino_sam",
+                        "visible": True,
+                    }
+                )
 
             annotation = {
                 "image_id": image_id,
                 "filename": image["filename"],
-                "width": result["width"],
-                "height": result["height"],
+                "width": width,
+                "height": height,
                 "masks": masks,
                 "history": [],
                 "updated_at": time.time(),
@@ -441,7 +620,8 @@ async def _run_batch_auto_annotate(project_id: str, image_ids: List[str], req: A
         JOBS[job_id]["elapsed_seconds"] = int(elapsed)
         JOBS[job_id]["last_image_duration_ms"] = int((time.time() - item_start) * 1000)
 
-    JOBS[job_id]["status"] = "completed"
+    if JOBS[job_id]["status"] == "running":
+        JOBS[job_id]["status"] = "completed"
 
 
 @app.post("/api/projects/{project_id}/annotate/auto/batch")
@@ -454,6 +634,14 @@ async def auto_annotate_batch(project_id: str, payload: AutoAnnotateRequest, bac
     image_ids = [item["id"] for item in images]
     if not image_ids:
         raise HTTPException(status_code=400, detail="No images uploaded")
+
+    objects = _resolve_prompt_objects(project_id, payload.objects)
+    if not objects:
+        raise HTTPException(
+            status_code=400,
+            detail="objects must contain at least one prompt or the project must already define classes",
+        )
+    payload.objects = objects
 
     job_id = str(uuid.uuid4())
     JOBS[job_id] = {
@@ -468,6 +656,7 @@ async def auto_annotate_batch(project_id: str, payload: AutoAnnotateRequest, bac
         "elapsed_seconds": 0,
         "last_image": None,
         "last_image_duration_ms": None,
+        "objects": objects,
         "errors": [],
     }
 
