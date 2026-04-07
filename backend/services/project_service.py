@@ -23,11 +23,27 @@ class ImageRecord:
 
 class ProjectService:
     def __init__(self, base_dir: Path):
-        self.base_dir = base_dir
+        self.base_dir = base_dir.resolve()
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _normalize_project_id(project_id: str) -> str:
+        try:
+            return str(uuid.UUID(project_id))
+        except Exception as exc:
+            raise FileNotFoundError(f"Project {project_id} not found") from exc
+
     def _project_dir(self, project_id: str) -> Path:
-        return self.base_dir / project_id
+        normalized_project_id = self._normalize_project_id(project_id)
+        candidate = (self.base_dir / normalized_project_id).resolve()
+        try:
+            candidate.relative_to(self.base_dir)
+        except ValueError as exc:
+            raise FileNotFoundError(f"Project {project_id} not found") from exc
+        return candidate
+
+    def project_dir(self, project_id: str) -> Path:
+        return self._project_dir(project_id)
 
     def _project_file(self, project_id: str) -> Path:
         return self._project_dir(project_id) / "project.json"

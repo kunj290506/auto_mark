@@ -13,6 +13,9 @@ import yaml
 from services.sam2_service import SAM2Service
 
 
+RNG = random.SystemRandom()
+
+
 @dataclass
 class AugmentationOptions:
     horizontal_flip: bool = False
@@ -63,7 +66,7 @@ class DatasetService:
             all_samples.append(sample)
             all_samples.extend(self._create_augmented_samples(sample, base_samples, aug_opts))
 
-        random.shuffle(all_samples)
+        RNG.shuffle(all_samples)
         split_idx = max(1, int(len(all_samples) * (1.0 - val_ratio)))
         train_samples = all_samples[:split_idx]
         val_samples = all_samples[split_idx:] if split_idx < len(all_samples) else []
@@ -163,14 +166,14 @@ class DatasetService:
                 results.append(self._rotate_right_angle(sample, deg))
 
         if opts.random_rotate_small:
-            deg = random.uniform(-15.0, 15.0)
+            deg = RNG.uniform(-15.0, 15.0)
             results.append(self._rotate_arbitrary(sample, deg))
 
         if opts.brightness_contrast:
             results.append(self._brightness_contrast(sample))
 
         if opts.mosaic and len(all_samples) >= 4:
-            picked = random.sample(all_samples, 4)
+            picked = RNG.sample(all_samples, 4)
             results.append(self._mosaic(picked))
 
         if opts.resize_width and opts.resize_height:
@@ -359,8 +362,8 @@ class DatasetService:
 
     def _brightness_contrast(self, sample: Dict) -> Dict:
         image = sample["image"]
-        alpha = random.uniform(0.8, 1.2)
-        beta = random.uniform(-25.0, 25.0)
+        alpha = RNG.uniform(0.8, 1.2)
+        beta = RNG.uniform(-25.0, 25.0)
         adjusted = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
         return {**sample, "image": adjusted}
 

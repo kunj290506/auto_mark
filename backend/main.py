@@ -3,6 +3,7 @@
 import io
 import os
 import re
+import secrets
 import shutil
 import tempfile
 import time
@@ -17,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.requests import Request
 from fastapi.responses import Response
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel, Field
 
@@ -43,6 +44,11 @@ MAX_UPLOAD_FILES = int(os.getenv("MAX_UPLOAD_FILES", "1000"))
 MAX_ZIP_FILE_BYTES = int(os.getenv("MAX_ZIP_FILE_BYTES", str(1024 * 1024 * 1024)))
 MAX_ZIP_MEMBER_BYTES = int(os.getenv("MAX_ZIP_MEMBER_BYTES", str(25 * 1024 * 1024)))
 MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES = int(os.getenv("MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES", str(2 * 1024 * 1024 * 1024)))
+MAX_OBJECT_PROMPTS = int(os.getenv("MAX_OBJECT_PROMPTS", "100"))
+MAX_OBJECT_PROMPT_CHARS = int(os.getenv("MAX_OBJECT_PROMPT_CHARS", "64"))
+MAX_JOB_HISTORY = int(os.getenv("MAX_JOB_HISTORY", "200"))
+API_KEY = os.getenv("API_KEY", "").strip()
+API_KEY_HEADER = os.getenv("API_KEY_HEADER", "X-API-Key")
 
 
 def _cors_origins() -> List[str]:
@@ -58,6 +64,46 @@ def _validate_image_bytes(content: bytes) -> bool:
         return True
     except Exception:
         return False
+
+
+async def _read_limited_upload(upload: UploadFile, max_bytes: int) -> bytes:
+    data: List[bytes] = []
+    total = 0
+    while True:
+        chunk = await upload.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(status_code=400, detail=f"File too large. Max allowed: {max_bytes} bytes")
+        data.append(chunk)
+    return b"".join(data)
+
+
+async def _save_limited_upload(upload: UploadFile, target_path: Path, max_bytes: int):
+    total = 0
+    with open(target_path, "wb") as target:
+        while True:
+            chunk = await upload.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise HTTPException(status_code=400, detail=f"File too large. Max allowed: {max_bytes} bytes")
+            target.write(chunk)
+
+
+def _prune_jobs():
+    if len(JOBS) <= MAX_JOB_HISTORY:
+        return
+    removable = [
+        job_id
+        for job_id, info in JOBS.items()
+        if info.get("status") in {"completed", "failed"}
+    ]
+    overflow = len(JOBS) - MAX_JOB_HISTORY
+    for job_id in removable[:overflow]:
+        JOBS.pop(job_id, None)
 
 
 def _safe_project_name(name: str) -> str:
@@ -80,11 +126,15 @@ def _dedupe_objects(objects: List[str]) -> List[str]:
     seen = set()
     for item in objects:
         cleaned = (item or "").strip()
+        if len(cleaned) > MAX_OBJECT_PROMPT_CHARS:
+            cleaned = cleaned[:MAX_OBJECT_PROMPT_CHARS].strip()
         normalized = _normalize_label(cleaned)
         if not normalized or normalized in seen:
             continue
         seen.add(normalized)
         deduped.append(cleaned)
+        if len(deduped) >= MAX_OBJECT_PROMPTS:
+            break
     return deduped
 
 
@@ -190,6 +240,13 @@ def _resolve_detected_class_name(label: str, class_name_map: Dict[str, str]) -> 
     return label.strip() or "unlabeled"
 
 
+def _ensure_project_exists(project_id: str):
+    try:
+        project_service.get_project(project_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 class ProjectCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
 
@@ -222,7 +279,7 @@ class BoxPromptRequest(BaseModel):
 
 class AnnotationUpdateRequest(BaseModel):
     masks: List[Dict]
-    history: List[Dict] = []
+    history: List[Dict] = Field(default_factory=list)
 
 
 class ClassUpsertRequest(BaseModel):
@@ -248,12 +305,12 @@ class ShortcutAssignRequest(BaseModel):
 class ExportRequest(BaseModel):
     task: str = Field(default="segment")
     val_ratio: float = Field(default=0.2, ge=0.05, le=0.5)
-    augmentations: Dict = {}
+    augmentations: Dict = Field(default_factory=dict)
 
 
 class AugPreviewRequest(BaseModel):
     image_id: str
-    augmentations: Dict = {}
+    augmentations: Dict = Field(default_factory=dict)
 
 
 app = FastAPI(
@@ -279,6 +336,15 @@ app.add_middleware(
     ]
     + ["testserver"],
 )
+
+
+@app.middleware("http")
+async def api_key_middleware(request: Request, call_next):
+    if API_KEY and request.url.path.startswith("/api") and request.url.path != "/api/health":
+        provided_key = request.headers.get(API_KEY_HEADER, "")
+        if not provided_key or not secrets.compare_digest(provided_key, API_KEY):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -340,9 +406,7 @@ async def get_project(project_id: str):
 
 @app.post("/api/projects/{project_id}/upload/images")
 async def upload_images(project_id: str, files: List[UploadFile] = File(...)):
-    project_dir = PROJECTS_DIR / project_id
-    if not project_dir.exists():
-        raise HTTPException(status_code=404, detail="Project not found")
+    _ensure_project_exists(project_id)
 
     if len(files) > MAX_UPLOAD_FILES:
         raise HTTPException(status_code=400, detail=f"Too many files. Max allowed: {MAX_UPLOAD_FILES}")
@@ -355,9 +419,7 @@ async def upload_images(project_id: str, files: List[UploadFile] = File(...)):
                 continue
             safe_name = f"{uuid.uuid4()}{suffix}"
             target = Path(tmp) / safe_name
-            content = await file.read()
-            if len(content) > MAX_IMAGE_FILE_BYTES:
-                raise HTTPException(status_code=400, detail=f"Image too large: {file.filename}")
+            content = await _read_limited_upload(file, MAX_IMAGE_FILE_BYTES)
             if not _validate_image_bytes(content):
                 raise HTTPException(status_code=400, detail=f"Invalid image: {file.filename}")
             target.write_bytes(content)
@@ -373,16 +435,11 @@ async def upload_zip(project_id: str, file: UploadFile = File(...)):
     if not (file.filename or "").lower().endswith(".zip"):
         raise HTTPException(status_code=400, detail="Only .zip files are supported")
 
-    project_dir = PROJECTS_DIR / project_id
-    if not project_dir.exists():
-        raise HTTPException(status_code=404, detail="Project not found")
+    _ensure_project_exists(project_id)
 
     with tempfile.TemporaryDirectory() as tmp:
         zip_path = Path(tmp) / "images.zip"
-        zip_content = await file.read()
-        if len(zip_content) > MAX_ZIP_FILE_BYTES:
-            raise HTTPException(status_code=400, detail="ZIP file too large")
-        zip_path.write_bytes(zip_content)
+        await _save_limited_upload(file, zip_path, MAX_ZIP_FILE_BYTES)
 
         extracted_paths: List[Path] = []
         total_uncompressed = 0
@@ -510,7 +567,7 @@ async def auto_annotate_single(project_id: str, payload: AutoAnnotateRequest):
     except Exception as exc:
         project_service.log_error(project_id, f"Auto-annotate failed for {payload.image_id}: {exc}")
         project_service.set_image_status(project_id, payload.image_id, "unannotated")
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail="Auto-annotation failed")
 
 
 async def _run_batch_auto_annotate(project_id: str, image_ids: List[str], req: AutoAnnotateRequest, job_id: str):
@@ -528,7 +585,7 @@ async def _run_batch_auto_annotate(project_id: str, image_ids: List[str], req: A
             raise RuntimeError(warmup_error)
     except Exception as exc:
         JOBS[job_id]["status"] = "failed"
-        JOBS[job_id]["errors"].append({"image_id": None, "error": str(exc)})
+        JOBS[job_id]["errors"].append({"image_id": None, "error": "warmup_failed"})
         project_service.log_error(project_id, f"Batch annotate warm-up failed: {exc}")
         return
 
@@ -576,9 +633,13 @@ async def _run_batch_auto_annotate(project_id: str, image_ids: List[str], req: A
                 raw_label = str(labels[idx]) if idx < len(labels) else "unlabeled"
                 class_name = _resolve_detected_class_name(raw_label, class_name_map)
                 if class_name != "unlabeled":
-                    stored_class = project_service.upsert_class(project_id, class_name)
-                    class_name_map[_normalize_label(stored_class["name"])] = stored_class["name"]
-                    class_name = stored_class["name"]
+                    normalized_class_name = _normalize_label(class_name)
+                    if normalized_class_name in class_name_map:
+                        class_name = class_name_map[normalized_class_name]
+                    else:
+                        stored_class = project_service.upsert_class(project_id, class_name)
+                        class_name_map[_normalize_label(stored_class["name"])] = stored_class["name"]
+                        class_name = stored_class["name"]
 
                 masks.append(
                     {
@@ -607,7 +668,7 @@ async def _run_batch_auto_annotate(project_id: str, image_ids: List[str], req: A
             JOBS[job_id]["last_image"] = image["filename"]
         except Exception as exc:
             JOBS[job_id]["skipped"] += 1
-            JOBS[job_id]["errors"].append({"image_id": image_id, "error": str(exc)})
+            JOBS[job_id]["errors"].append({"image_id": image_id, "error": "annotation_failed"})
             project_service.log_error(project_id, f"Batch annotate failed for {image_id}: {exc}")
             project_service.set_image_status(project_id, image_id, "unannotated")
 
@@ -642,6 +703,8 @@ async def auto_annotate_batch(project_id: str, payload: AutoAnnotateRequest, bac
             detail="objects must contain at least one prompt or the project must already define classes",
         )
     payload.objects = objects
+
+    _prune_jobs()
 
     job_id = str(uuid.uuid4())
     JOBS[job_id] = {
@@ -819,7 +882,8 @@ async def augmentation_preview(project_id: str, payload: AugPreviewRequest):
             raise ValueError("Failed to encode preview image")
         return StreamingResponse(io.BytesIO(encoded.tobytes()), media_type="image/jpeg")
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        project_service.log_error(project_id, f"Augmentation preview failed: {exc}")
+        raise HTTPException(status_code=500, detail="Augmentation preview failed")
 
 
 @app.post("/api/projects/{project_id}/export")
@@ -831,7 +895,7 @@ async def export_dataset(project_id: str, payload: ExportRequest):
         project = project_service.get_project(project_id)
         classes = project_service.list_classes(project_id)
         annotations = project_service.all_annotations(project_id)
-        project_dir = PROJECTS_DIR / project_id
+        project_dir = project_service.project_dir(project_id)
 
         result = dataset_service.export_dataset(
             project_dir=project_dir,
@@ -849,12 +913,15 @@ async def export_dataset(project_id: str, payload: ExportRequest):
         }
     except Exception as exc:
         project_service.log_error(project_id, f"Export failed: {exc}")
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail="Export failed")
 
 
 @app.get("/api/projects/{project_id}/export/download")
 async def download_export(project_id: str):
-    zip_path = PROJECTS_DIR / project_id / "exports" / "dataset_export.zip"
+    try:
+        zip_path = project_service.project_dir(project_id) / "exports" / "dataset_export.zip"
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     if not zip_path.exists():
         raise HTTPException(status_code=404, detail="Export ZIP not found")
     return FileResponse(zip_path, filename=f"{project_id}_dataset_export.zip", media_type="application/zip")
@@ -862,7 +929,10 @@ async def download_export(project_id: str):
 
 @app.get("/api/projects/{project_id}/export/coco")
 async def download_coco_json(project_id: str):
-    coco_path = PROJECTS_DIR / project_id / "exports" / "dataset" / "coco_annotations.json"
+    try:
+        coco_path = project_service.project_dir(project_id) / "exports" / "dataset" / "coco_annotations.json"
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     if not coco_path.exists():
         raise HTTPException(status_code=404, detail="COCO JSON not found")
     return FileResponse(coco_path, filename=f"{project_id}_coco_annotations.json", media_type="application/json")
@@ -870,7 +940,10 @@ async def download_coco_json(project_id: str):
 
 @app.delete("/api/projects/{project_id}")
 async def delete_project(project_id: str):
-    project_dir = PROJECTS_DIR / project_id
+    try:
+        project_dir = project_service.project_dir(project_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     if not project_dir.exists():
         raise HTTPException(status_code=404, detail="Project not found")
     shutil.rmtree(project_dir)
@@ -880,4 +953,4 @@ async def delete_project(project_id: str):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=os.getenv("HOST", "127.0.0.1"), port=int(os.getenv("PORT", "8000")))

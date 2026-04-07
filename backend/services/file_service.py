@@ -16,6 +16,8 @@ class FileService:
     
     ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
     MAX_FILE_SIZE = 1024 * 1024 * 1024  # 1GB
+    MAX_MEMBER_SIZE = 25 * 1024 * 1024
+    MAX_TOTAL_UNCOMPRESSED = 2 * 1024 * 1024 * 1024
     
     def __init__(self, upload_dir: Path, temp_dir: Path):
         self.upload_dir = upload_dir
@@ -34,15 +36,21 @@ class FileService:
         
         # Save zip file
         zip_path = self.temp_dir / f"{session_id}.zip"
-        
+
+        total_uploaded = 0
         async with aiofiles.open(zip_path, 'wb') as f:
-            content = await file.read()
-            if len(content) > self.MAX_FILE_SIZE:
-                raise ValueError(f"File too large. Maximum size is 1GB")
-            await f.write(content)
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_uploaded += len(chunk)
+                if total_uploaded > self.MAX_FILE_SIZE:
+                    raise ValueError("File too large. Maximum size is 1GB")
+                await f.write(chunk)
         
         # Extract zip file
         images = []
+        total_uncompressed = 0
         try:
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 for member in zip_ref.namelist():
@@ -57,6 +65,13 @@ class FileService:
                     # Check if it's an image
                     ext = Path(member).suffix.lower()
                     if ext in self.ALLOWED_EXTENSIONS:
+                        info = zip_ref.getinfo(member)
+                        if info.file_size > self.MAX_MEMBER_SIZE:
+                            continue
+                        total_uncompressed += info.file_size
+                        if total_uncompressed > self.MAX_TOTAL_UNCOMPRESSED:
+                            raise ValueError("Zip content too large after extraction")
+
                         # Extract file
                         filename = Path(member).name
                         target_path = session_dir / filename
@@ -70,7 +85,7 @@ class FileService:
                         
                         with zip_ref.open(member) as source:
                             with open(target_path, 'wb') as target:
-                                target.write(source.read())
+                                shutil.copyfileobj(source, target, length=1024 * 1024)
                         
                         images.append(str(target_path))
             

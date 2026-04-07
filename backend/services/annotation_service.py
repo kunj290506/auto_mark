@@ -26,6 +26,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 # Model paths
 DEFAULT_MODELS_DIR = Path(os.environ.get("MODELS_DIR", "./models"))
+GROUNDING_DINO_MODEL_ID = os.environ.get("GROUNDING_DINO_MODEL_ID", "IDEA-Research/grounding-dino-base")
+GROUNDING_DINO_MODEL_REVISION = os.environ.get(
+    "GROUNDING_DINO_MODEL_REVISION",
+    "12bdfa3120f3e7ec7b434d90674b3396eccf88eb",
+)
 
 # Thread pool for running sync inference off the event loop (Bug 5)
 _executor = ThreadPoolExecutor(max_workers=1)
@@ -65,11 +70,21 @@ class AnnotationService:
             from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
             
             # Use BASE model for higher accuracy (52.5 AP vs 50.6 AP for tiny)
-            model_id = "IDEA-Research/grounding-dino-base"
-            print(f"[INFO] Loading Grounding DINO BASE from HuggingFace ({model_id})...")
-            
-            self.processor = AutoProcessor.from_pretrained(model_id)
-            self.model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id)
+            print(
+                f"[INFO] Loading Grounding DINO BASE from HuggingFace "
+                f"({GROUNDING_DINO_MODEL_ID}@{GROUNDING_DINO_MODEL_REVISION})..."
+            )
+
+            self.processor = AutoProcessor.from_pretrained(
+                GROUNDING_DINO_MODEL_ID,
+                revision=GROUNDING_DINO_MODEL_REVISION,
+                trust_remote_code=False,
+            )
+            self.model = AutoModelForZeroShotObjectDetection.from_pretrained(
+                GROUNDING_DINO_MODEL_ID,
+                revision=GROUNDING_DINO_MODEL_REVISION,
+                trust_remote_code=False,
+            )
             self.model = self.model.to(self.device)
             
             # Bug 2: Enable FP16 only on CUDA
@@ -82,8 +97,8 @@ class AnnotationService:
                 import torch._dynamo
                 self.model = torch.compile(self.model, mode="reduce-overhead")
                 print("   torch.compile enabled")
-            except Exception:
-                pass  # torch.compile not available
+            except Exception as compile_exc:
+                print(f"   torch.compile unavailable: {compile_exc}")
             
             self.model.eval()
             
@@ -128,25 +143,30 @@ class AnnotationService:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(_executor, self._warmup_sync, require_sam)
 
-    def _warmup_sync(self, require_sam: bool = True) -> Optional[str]:
+    @staticmethod
+    def _run_coroutine_sync(coro):
         import asyncio as _asyncio
 
-        warmup_loop = _asyncio.new_event_loop()
+        loop = _asyncio.new_event_loop()
         try:
-            model_ready = warmup_loop.run_until_complete(self._load_model())
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def _warmup_sync(self, require_sam: bool = True) -> Optional[str]:
+        try:
+            model_ready = self._run_coroutine_sync(self._load_model())
             if not model_ready:
                 return "Grounding DINO Base model failed to load"
 
             if require_sam:
-                sam_ready = warmup_loop.run_until_complete(self._load_sam())
+                sam_ready = self._run_coroutine_sync(self._load_sam())
                 if not sam_ready:
                     return "SAM model checkpoint failed to load"
 
             return None
         except Exception as exc:
             return str(exc)
-        finally:
-            warmup_loop.close()
     
     # Bug 5: async annotate_image delegates to sync pipeline via executor
     async def annotate_image(
@@ -192,22 +212,11 @@ class AnnotationService:
             return {"boxes": [], "labels": [], "scores": [], "segmentations": [], "error": str(e)}
         
         width, height = image.size
-        
-        # Load model (sync wrapper for _load_model)
-        import asyncio as _asyncio
-        try:
-            _loop = _asyncio.get_event_loop()
-            if _loop.is_running():
-                # We're in a thread executor, need a new loop
-                _new_loop = _asyncio.new_event_loop()
-                model_ready = _new_loop.run_until_complete(self._load_model())
-                _new_loop.close()
-            else:
-                model_ready = _loop.run_until_complete(self._load_model())
-        except RuntimeError:
-            _new_loop = _asyncio.new_event_loop()
-            model_ready = _new_loop.run_until_complete(self._load_model())
-            _new_loop.close()
+
+        # Avoid repeated event-loop setup once models are loaded.
+        model_ready = True
+        if not self._model_loaded:
+            model_ready = self._run_coroutine_sync(self._load_model())
         
         if not model_ready:
             # Bug 6: Return clear error instead of mock annotations
@@ -272,12 +281,13 @@ class AnnotationService:
         
         # Run SAM segmentation if enabled and we have detections
         if use_sam and len(detection_result["boxes"]) > 0:
-            try:
-                _new_loop = _asyncio.new_event_loop()
-                sam_ready = _new_loop.run_until_complete(self._load_sam())
-                _new_loop.close()
-            except Exception:
-                sam_ready = False
+            if self._sam_loaded:
+                sam_ready = True
+            else:
+                try:
+                    sam_ready = self._run_coroutine_sync(self._load_sam())
+                except Exception:
+                    sam_ready = False
             
             if sam_ready:
                 try:
@@ -493,6 +503,7 @@ class AnnotationService:
         """Format detection results into standard format with label cleaning"""
         normalized_boxes = []
         cleaned_labels = []
+        valid_scores = []
         
         for idx, box in enumerate(boxes):
             if is_cxcywh:
@@ -528,11 +539,7 @@ class AnnotationService:
             # Clean the label
             label = labels[idx] if idx < len(labels) else (objects[0] if objects else "object")
             cleaned_labels.append(self._clean_label(label, objects))
-        
-        # Filter scores to match remaining boxes
-        valid_scores = [scores[i] for i in range(len(scores)) if i < len(boxes)]
-        # Trim to match normalized_boxes count (some may have been removed as degenerate)
-        valid_scores = valid_scores[:len(normalized_boxes)]
+            valid_scores.append(float(scores[idx]) if idx < len(scores) else 0.0)
         
         return {
             "boxes": normalized_boxes,
@@ -570,27 +577,28 @@ class AnnotationService:
         """
         if not boxes:
             return boxes, labels, scores
-        
-        # Sort indices by score descending
-        indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
-        
-        keep = []
-        suppressed = set()
-        
-        for i in indices:
-            if i in suppressed:
-                continue
-            keep.append(i)
-            
-            for j in indices:
-                if j in suppressed or j == i:
+
+        label_groups: Dict[str, List[int]] = {}
+        for idx in range(len(boxes)):
+            label = labels[idx] if idx < len(labels) else "object"
+            label_groups.setdefault(label, []).append(idx)
+
+        keep: List[int] = []
+        for group_indices in label_groups.values():
+            sorted_group = sorted(group_indices, key=lambda i: scores[i], reverse=True)
+            suppressed = set()
+            for pos, i in enumerate(sorted_group):
+                if i in suppressed:
                     continue
-                if j in [k for k in keep]:
-                    continue
-                    
-                iou = self._compute_iou(boxes[i], boxes[j])
-                if iou > iou_threshold:
-                    suppressed.add(j)
+                keep.append(i)
+                for j in sorted_group[pos + 1 :]:
+                    if j in suppressed:
+                        continue
+                    iou = self._compute_iou(boxes[i], boxes[j])
+                    if iou > iou_threshold:
+                        suppressed.add(j)
+
+        keep.sort(key=lambda i: scores[i], reverse=True)
         
         return (
             [boxes[i] for i in keep],

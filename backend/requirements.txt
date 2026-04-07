@@ -9,4 +9,5 @@ torchvision>=0.17.0
 transformers>=4.40.0
 git+https://github.com/facebookresearch/segment-anything.git
 pyyaml>=6.0.1
+defusedxml>=0.7.1
 git+https://github.com/facebookresearch/sam2.git

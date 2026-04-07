@@ -9,8 +9,7 @@ import yaml
 from pathlib import Path
 from typing import Dict, List
 from datetime import datetime
-import xml.etree.ElementTree as ET
-from xml.dom import minidom
+from defusedxml import ElementTree as ET
 
 
 class ExportService:
@@ -75,6 +74,12 @@ class ExportService:
         for ann in annotations.values():
             if "labels" in ann:
                 classes.update(ann["labels"])
+            if "masks" in ann:
+                classes.update(
+                    mask.get("class_name", "")
+                    for mask in ann["masks"]
+                    if mask.get("class_name") and mask.get("class_name") != "unlabeled"
+                )
         return sorted(list(classes))
     
     async def _export_coco(
@@ -85,6 +90,7 @@ class ExportService:
         class_names: List[str]
     ):
         """Export in COCO JSON format with segmentation support"""
+        class_to_id = {name: i + 1 for i, name in enumerate(class_names)}
         
         coco_data = {
             "info": {
@@ -127,7 +133,7 @@ class ExportService:
                 label = labels[i] if i < len(labels) else "unknown"
                 score = scores[i] if i < len(scores) else 1.0
                 
-                category_id = class_names.index(label) + 1 if label in class_names else 1
+                category_id = class_to_id.get(label, 1)
                 
                 # Convert normalized to pixel coordinates
                 x = box["x"] * size["width"]
@@ -186,6 +192,7 @@ class ExportService:
         class_names: List[str]
     ):
         """Export in YOLO format (separate .txt files)"""
+        class_to_id = {name: i for i, name in enumerate(class_names)}
         
         labels_dir = export_dir / "labels"
         labels_dir.mkdir(exist_ok=True)
@@ -217,7 +224,7 @@ class ExportService:
             with open(label_file, 'w') as f:
                 for i, box in enumerate(boxes):
                     label = labels[i] if i < len(labels) else "unknown"
-                    class_id = class_names.index(label) if label in class_names else 0
+                    class_id = class_to_id.get(label, 0)
                     
                     # YOLO format: class_id center_x center_y width height (normalized)
                     cx = box["x"] + box["width"] / 2
@@ -283,11 +290,10 @@ class ExportService:
                 ET.SubElement(bndbox, "xmax").text = str(int(box["x2"]))
                 ET.SubElement(bndbox, "ymax").text = str(int(box["y2"]))
             
-            # Pretty print XML
-            xml_str = minidom.parseString(ET.tostring(annotation)).toprettyxml(indent="  ")
-            
-            with open(annotations_dir / f"{path.stem}.xml", 'w') as f:
-                f.write(xml_str)
+            xml_bytes = ET.tostring(annotation, encoding="utf-8")
+            with open(annotations_dir / f"{path.stem}.xml", 'wb') as f:
+                f.write(b'<?xml version="1.0" encoding="utf-8"?>\n')
+                f.write(xml_bytes)
     
     async def _export_roboflow(
         self,
