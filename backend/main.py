@@ -9,6 +9,7 @@ import tempfile
 import time
 import uuid
 import zipfile
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -47,8 +48,54 @@ MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES = int(os.getenv("MAX_ZIP_TOTAL_UNCOMPRESSED_BYT
 MAX_OBJECT_PROMPTS = int(os.getenv("MAX_OBJECT_PROMPTS", "100"))
 MAX_OBJECT_PROMPT_CHARS = int(os.getenv("MAX_OBJECT_PROMPT_CHARS", "64"))
 MAX_JOB_HISTORY = int(os.getenv("MAX_JOB_HISTORY", "200"))
+CLASS_MATCH_MIN_SCORE = float(os.getenv("CLASS_MATCH_MIN_SCORE", "0.68"))
 API_KEY = os.getenv("API_KEY", "").strip()
 API_KEY_HEADER = os.getenv("API_KEY_HEADER", "X-API-Key")
+
+_LABEL_STOPWORDS = {
+    "a",
+    "an",
+    "the",
+    "of",
+    "and",
+    "or",
+    "object",
+    "objects",
+    "item",
+    "items",
+}
+
+_LABEL_ALIASES = {
+    "people": "person",
+    "human": "person",
+    "man": "person",
+    "woman": "person",
+    "boy": "person",
+    "girl": "person",
+    "bike": "bicycle",
+    "cycle": "bicycle",
+    "cyclist": "bicycle",
+    "automobile": "car",
+    "vehicle": "car",
+    "sedan": "car",
+    "suv": "car",
+    "van": "car",
+    "cellphone": "phone",
+    "smartphone": "phone",
+    "mobile": "phone",
+    "mobile phone": "phone",
+    "cell phone": "phone",
+    "telephone": "phone",
+    "handset": "phone",
+    "kitty": "cat",
+    "kitten": "cat",
+    "feline": "cat",
+    "doggo": "dog",
+    "puppy": "dog",
+    "canine": "dog",
+    "trafficlight": "traffic light",
+    "traffic light": "traffic light",
+}
 
 
 def _cors_origins() -> List[str]:
@@ -121,6 +168,87 @@ def _normalize_label(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip().lower())
 
 
+def _apply_label_alias(value: str) -> str:
+    if not value:
+        return value
+
+    direct = _LABEL_ALIASES.get(value)
+    if direct:
+        return direct
+
+    squashed = value.replace(" ", "")
+    return _LABEL_ALIASES.get(squashed, value)
+
+
+def _singularize_token(token: str) -> str:
+    if len(token) <= 3:
+        return token
+    if token.endswith("ies") and len(token) > 4:
+        return token[:-3] + "y"
+    if token.endswith(("ches", "shes", "xes", "zes", "ses")) and len(token) > 4:
+        return token[:-2]
+    if token.endswith("sses") and len(token) > 5:
+        return token[:-2]
+    if token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
+def _tokenize_label(value: str) -> List[str]:
+    normalized = _normalize_label(value)
+    normalized = re.sub(r"[^a-z0-9 ]+", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return []
+
+    normalized = _apply_label_alias(normalized)
+
+    tokens: List[str] = []
+    for token in normalized.split(" "):
+        if not token or token in _LABEL_STOPWORDS:
+            continue
+        token = _apply_label_alias(_singularize_token(token))
+        if token and token not in _LABEL_STOPWORDS:
+            tokens.append(token)
+    return tokens
+
+
+def _canonical_label(value: str) -> str:
+    tokens = _tokenize_label(value)
+    canonical = " ".join(tokens)
+    return _apply_label_alias(canonical)
+
+
+def _label_match_score(source_label: str, candidate_label: str) -> float:
+    if not source_label or not candidate_label:
+        return 0.0
+
+    if source_label == candidate_label:
+        return 1.0
+
+    source_tokens = set(_tokenize_label(source_label))
+    candidate_tokens = set(_tokenize_label(candidate_label))
+
+    token_score = 0.0
+    if source_tokens and candidate_tokens:
+        overlap = len(source_tokens & candidate_tokens)
+        union = len(source_tokens | candidate_tokens)
+        token_score = overlap / max(1, union)
+
+    char_score = SequenceMatcher(None, source_label, candidate_label).ratio()
+    containment_bonus = 0.0
+    if source_label in candidate_label or candidate_label in source_label:
+        containment_bonus = 0.2
+
+    semantic_bonus = 0.0
+    if len(candidate_tokens) == 1 and next(iter(candidate_tokens)) in source_tokens:
+        semantic_bonus = 0.12
+    elif len(source_tokens) == 1 and next(iter(source_tokens)) in candidate_tokens:
+        semantic_bonus = 0.08
+
+    return min(1.0, (0.65 * token_score) + (0.35 * char_score) + containment_bonus + semantic_bonus)
+
+
 def _dedupe_objects(objects: List[str]) -> List[str]:
     deduped: List[str] = []
     seen = set()
@@ -128,7 +256,7 @@ def _dedupe_objects(objects: List[str]) -> List[str]:
         cleaned = (item or "").strip()
         if len(cleaned) > MAX_OBJECT_PROMPT_CHARS:
             cleaned = cleaned[:MAX_OBJECT_PROMPT_CHARS].strip()
-        normalized = _normalize_label(cleaned)
+        normalized = _canonical_label(cleaned)
         if not normalized or normalized in seen:
             continue
         seen.add(normalized)
@@ -225,17 +353,33 @@ def _bbox_from_detection(box: Dict[str, Any], image_width: int, image_height: in
     }
 
 
-def _resolve_detected_class_name(label: str, class_name_map: Dict[str, str]) -> str:
-    normalized = _normalize_label(label)
+def _resolve_detected_class_name(
+    label: str,
+    class_name_map: Dict[str, str],
+    prompt_name_map: Optional[Dict[str, str]] = None,
+) -> str:
+    normalized = _canonical_label(label)
     if not normalized:
         return "unlabeled"
 
-    if normalized in class_name_map:
-        return class_name_map[normalized]
+    candidates = dict(class_name_map)
+    if prompt_name_map:
+        for key, value in prompt_name_map.items():
+            candidates.setdefault(key, value)
 
-    for known_norm, known_name in class_name_map.items():
-        if normalized in known_norm or known_norm in normalized:
-            return known_name
+    if normalized in candidates:
+        return candidates[normalized]
+
+    best_name = ""
+    best_score = 0.0
+    for known_norm, known_name in candidates.items():
+        score = _label_match_score(normalized, known_norm)
+        if score > best_score:
+            best_score = score
+            best_name = known_name
+
+    if best_name and best_score >= CLASS_MATCH_MIN_SCORE:
+        return best_name
 
     return label.strip() or "unlabeled"
 
@@ -573,11 +717,20 @@ async def auto_annotate_single(project_id: str, payload: AutoAnnotateRequest):
 async def _run_batch_auto_annotate(project_id: str, image_ids: List[str], req: AutoAnnotateRequest, job_id: str):
     start = time.time()
     processed = 0
-    class_name_map = {
-        _normalize_label(cls.get("name", "")): cls["name"]
-        for cls in project_service.list_classes(project_id)
-        if cls.get("name")
-    }
+    class_name_map: Dict[str, str] = {}
+    for cls in project_service.list_classes(project_id):
+        raw_name = str(cls.get("name", "")).strip()
+        if not raw_name:
+            continue
+        canonical_name = _canonical_label(raw_name)
+        if canonical_name:
+            class_name_map[canonical_name] = raw_name
+
+    prompt_name_map: Dict[str, str] = {}
+    for name in req.objects:
+        canonical_name = _canonical_label(name)
+        if canonical_name:
+            prompt_name_map[canonical_name] = name
 
     try:
         warmup_error = await annotation_service.warmup(require_sam=True)
@@ -631,14 +784,16 @@ async def _run_batch_auto_annotate(project_id: str, image_ids: List[str], req: A
                     continue
 
                 raw_label = str(labels[idx]) if idx < len(labels) else "unlabeled"
-                class_name = _resolve_detected_class_name(raw_label, class_name_map)
+                class_name = _resolve_detected_class_name(raw_label, class_name_map, prompt_name_map)
                 if class_name != "unlabeled":
-                    normalized_class_name = _normalize_label(class_name)
+                    normalized_class_name = _canonical_label(class_name)
                     if normalized_class_name in class_name_map:
                         class_name = class_name_map[normalized_class_name]
                     else:
                         stored_class = project_service.upsert_class(project_id, class_name)
-                        class_name_map[_normalize_label(stored_class["name"])] = stored_class["name"]
+                        canonical_name = _canonical_label(stored_class["name"])
+                        class_name_map[canonical_name] = stored_class["name"]
+                        prompt_name_map.setdefault(canonical_name, stored_class["name"])
                         class_name = stored_class["name"]
 
                 masks.append(

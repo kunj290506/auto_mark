@@ -15,11 +15,13 @@ Key accuracy features:
 """
 
 import os
+import re
 import asyncio
 import torch
 import numpy as np
 import cv2
 from pathlib import Path
+from difflib import SequenceMatcher
 from typing import List, Dict, Optional, Tuple
 from PIL import Image
 from concurrent.futures import ThreadPoolExecutor
@@ -31,6 +33,37 @@ GROUNDING_DINO_MODEL_REVISION = os.environ.get(
     "GROUNDING_DINO_MODEL_REVISION",
     "12bdfa3120f3e7ec7b434d90674b3396eccf88eb",
 )
+
+_LABEL_STOPWORDS = {"a", "an", "the", "of", "and", "or", "object", "objects", "item", "items"}
+_LABEL_ALIASES = {
+    "people": "person",
+    "human": "person",
+    "man": "person",
+    "woman": "person",
+    "boy": "person",
+    "girl": "person",
+    "bike": "bicycle",
+    "cycle": "bicycle",
+    "cyclist": "bicycle",
+    "automobile": "car",
+    "vehicle": "car",
+    "sedan": "car",
+    "suv": "car",
+    "van": "car",
+    "cellphone": "phone",
+    "smartphone": "phone",
+    "mobile": "phone",
+    "mobile phone": "phone",
+    "cell phone": "phone",
+    "telephone": "phone",
+    "handset": "phone",
+    "kitty": "cat",
+    "kitten": "cat",
+    "feline": "cat",
+    "doggo": "dog",
+    "puppy": "dog",
+    "canine": "dog",
+}
 
 # Thread pool for running sync inference off the event loop (Bug 5)
 _executor = ThreadPoolExecutor(max_workers=1)
@@ -397,15 +430,74 @@ class AnnotationService:
         Strips whitespace, removes trailing periods, and attempts
         to match the label back to one of the original object names.
         """
-        cleaned = label.strip().lower().rstrip(".").strip()
-        
-        # Try to match to one of the original object names
+        cleaned = self._normalize_label_text(label)
+        if not cleaned:
+            return "object"
+
+        best_name = ""
+        best_score = 0.0
         for obj in objects:
-            obj_clean = obj.strip().lower()
-            if obj_clean in cleaned or cleaned in obj_clean:
-                return obj_clean
-        
-        return cleaned if cleaned else "object"
+            obj_clean = self._normalize_label_text(obj)
+            if not obj_clean:
+                continue
+            score = self._label_similarity(cleaned, obj_clean)
+            if score > best_score:
+                best_score = score
+                best_name = obj_clean
+
+        if best_name and best_score >= 0.58:
+            return best_name
+
+        return cleaned
+
+    @staticmethod
+    def _normalize_label_text(value: str) -> str:
+        value = (value or "").strip().lower().rstrip(".")
+        value = re.sub(r"[^a-z0-9 ]+", " ", value)
+        value = re.sub(r"\s+", " ", value).strip()
+        if value in _LABEL_ALIASES:
+            value = _LABEL_ALIASES[value]
+        squashed = value.replace(" ", "")
+        if squashed in _LABEL_ALIASES:
+            value = _LABEL_ALIASES[squashed]
+
+        tokens = []
+        for token in value.split(" "):
+            if not token or token in _LABEL_STOPWORDS:
+                continue
+            if token.endswith("ies") and len(token) > 4:
+                token = token[:-3] + "y"
+            elif token.endswith(("ches", "shes", "xes", "zes", "ses")) and len(token) > 4:
+                token = token[:-2]
+            elif token.endswith("s") and len(token) > 3 and not token.endswith("ss"):
+                token = token[:-1]
+            token = _LABEL_ALIASES.get(token, token)
+            tokens.append(token)
+        normalized = " ".join(tokens)
+        return _LABEL_ALIASES.get(normalized, normalized)
+
+    @staticmethod
+    def _label_similarity(source: str, target: str) -> float:
+        if not source or not target:
+            return 0.0
+        if source == target:
+            return 1.0
+
+        source_tokens = set(source.split(" "))
+        target_tokens = set(target.split(" "))
+        overlap = len(source_tokens & target_tokens)
+        union = len(source_tokens | target_tokens)
+        token_score = overlap / max(1, union)
+        char_score = SequenceMatcher(None, source, target).ratio()
+        containment_bonus = 0.2 if (source in target or target in source) else 0.0
+
+        semantic_bonus = 0.0
+        if len(target_tokens) == 1 and next(iter(target_tokens)) in source_tokens:
+            semantic_bonus = 0.12
+        elif len(source_tokens) == 1 and next(iter(source_tokens)) in target_tokens:
+            semantic_bonus = 0.08
+
+        return min(1.0, 0.65 * token_score + 0.35 * char_score + containment_bonus + semantic_bonus)
     
     def _run_detection_sync(
         self,
